@@ -1,7 +1,10 @@
 package com.fj.dyhd;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.DialogInterface;
 import android.content.SharedPreferences;
+import android.text.InputType;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -11,6 +14,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageView;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Switch;
@@ -61,10 +65,63 @@ public class MainActivity extends Activity {
         return t;
     }
 
+    private long longSkipSeconds() { return getSharedPreferences(PREF, MODE_PRIVATE).getLong("longSkipSec", 0L); }
+
+    private String longSkipValueText() {
+        long m = longSkipSeconds();
+        return m <= 0 ? "已关闭" : (m + " 分钟");
+    }
+
+    private String longSkipSummary() {
+        long m = longSkipSeconds();
+        if (m <= 0) return "关闭，不跳过任何视频";
+        return "超过 " + m + " 分钟的视频自动划过";
+    }
+
+    private void editLongSkip() {
+        final EditText et = new EditText(this);
+        et.setInputType(InputType.TYPE_CLASS_NUMBER);
+        et.setText(String.valueOf(longSkipSeconds()));
+        et.setHint("0 = 关闭，1 = 1 分钟，10 = 10 分钟");
+        et.setTextSize(15f);
+        et.setPadding((int) dp(12), (int) dp(8), (int) dp(12), (int) dp(8));
+
+        new AlertDialog.Builder(this)
+                .setTitle("长视频跳过")
+                .setMessage("0 = 关闭\n1 = 超过 1 分钟自动跳\n10 = 超过 10 分钟自动跳")
+                .setView(et)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("保存", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int w) {
+                        long m = 0;
+                        try { m = Long.parseLong(et.getText().toString().trim()); } catch (Throwable ignored) {}
+                        if (m < 0) m = 0;
+                        if (m > 36000) m = 36000;
+                        getSharedPreferences(PREF, MODE_PRIVATE).edit().putLong("longSkipSec", m).commit();
+                        makePrefsReadable();
+                    }
+                })
+                .show();
+    }
+
+    /** 让宿主进程（抖音）能读到模块的 prefs 文件 */
+    private void makePrefsReadable() {
+        try {
+            java.io.File f = new java.io.File(getApplicationInfo().dataDir
+                    + "/shared_prefs/" + PREF + ".xml");
+            if (!f.exists()) return;
+            f.setReadable(true, false);
+            try {
+                Runtime.getRuntime().exec(new String[]{"chmod", "644", f.getAbsolutePath()});
+            } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {}
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         final SharedPreferences sp = getSharedPreferences(PREF, MODE_PRIVATE);
+        makePrefsReadable();
 
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(BG);
@@ -104,9 +161,12 @@ public class MainActivity extends Activity {
         // ---------- switch card ----------
         LinearLayout c1 = card();
         final String[][] switches = {
-            {"enabled",  "高画质下载", "长按视频弹出画质选择"},
+            {"enabled",  "高画质下载", "悬浮球点开选画质下载"},
             {"emoji",    "表情下载",   "表情预览页长按「添加表情」自动转格式"},
-            {"autoPlay", "自动播放",   "当前视频播完自动下一个"}
+            {"autoPlay", "自动播放",   "当前视频播完自动下一个"},
+            {"adBlock",  "屏蔽广告",   "刷到广告自动划过"},
+            {"liveSkip", "直播跳过",   "刷到直播自动划过"},
+            {"longSkip", "长视频跳过", "长按本行设置时长（秒）"}
         };
         for (int i = 0; i < switches.length; i++) {
             final String key = switches[i][0];
@@ -132,6 +192,7 @@ public class MainActivity extends Activity {
                 @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean v) {
                     boolean ok = sp.edit().putBoolean(key, v).commit();
                     android.util.Log.i("DYHD", "pref " + key + "=" + v + " commit=" + ok);
+                    makePrefsReadable();
                 }
             });
             sw.setOnClickListener(new View.OnClickListener() {
@@ -141,10 +202,22 @@ public class MainActivity extends Activity {
                     if (sp.getBoolean(key, true) != v) {
                         boolean ok = sp.edit().putBoolean(key, v).commit();
                         android.util.Log.i("DYHD", "pref(clk) " + key + "=" + v + " commit=" + ok);
+                        makePrefsReadable();
                     }
                 }
             });
             row.addView(sw);
+
+            // 长视频跳过：长按整行设置时长（秒，0 = 不限制）
+            if ("longSkip".equals(key)) {
+                row.setOnLongClickListener(new View.OnLongClickListener() {
+                    @Override public boolean onLongClick(View v) {
+                        editLongSkip();
+                        return true;
+                    }
+                });
+            }
+
             c1.addView(row);
         }
         root.addView(c1);

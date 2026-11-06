@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.fj.dyhd"
-    android:versionCode="63"
-    android:versionName="9.8">
+    android:versionCode="74"
+    android:versionName="10.9">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
@@ -34,5 +34,10 @@
         <meta-data android:name="xposeddescription"
             android:value="抖plus：长按视频选择画质，无水印下载到相册" />
         <meta-data android:name="xposedminversion" android:value="101" />
+            <provider
+            android:name=".PrefProvider"
+            android:authorities="com.fj.dyhd.pref"
+            android:exported="true"
+            android:enabled="true" />
     </application>
 </manifest>

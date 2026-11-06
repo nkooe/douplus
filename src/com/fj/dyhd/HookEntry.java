@@ -52,13 +52,14 @@ public class HookEntry extends XposedModule {
         log(4, TAG, "onPackageLoaded pkg=" + pkg + " process=" + param.getApplicationInfo().processName);
 
         String a = hookDownloadAddr(cl);
-        String b = hookLongPress(cl);
+        // 长按面板注入已停用：改由全局悬浮球承担
+        String b = "panel-off";
         String c = hookCommentMedia(cl);
         hookPreviewButtons(cl);
         hookDialogEmoji(cl);
         hookActivityTracker(cl);
         hookAutoPlay(cl);
-        hookNativeMenuItem(cl);
+        // 原生菜单项已停用（悬浮球已足够）
         hookAwemeDesc(cl);
         log(4, TAG, "init addr=" + a + " panel=" + b + " comment=" + c);
         checkModuleConflicts();
@@ -1021,7 +1022,10 @@ public class HookEntry extends XposedModule {
                         Object ret = chain.proceed();
                         try {
                             Object self = chain.getThisObject();
-                            if (self != null) sLastAweme = self;
+                            if (self != null) {
+                                sLastAweme = self;
+                                checkAndSkipFeed(self);
+                            }
                         } catch (Throwable ignored) {}
                         return ret;
                     }
@@ -1091,11 +1095,16 @@ public class HookEntry extends XposedModule {
             iclp.gravity = Gravity.CENTER;
             fab.addView(icon, iclp);
 
+            // 用绝对坐标：Gravity.END 依赖父容器宽度，
+            // DecorView 刚 addView 时 getWidth() 还是 0，END 会失效落到左边
+            final int scrW = ctx.getResources().getDisplayMetrics().widthPixels;
+            int initLeft = scrW - size - (int) (14 * d);
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(size, size);
-            lp.gravity = Gravity.TOP | Gravity.END;
+            lp.gravity = Gravity.TOP | Gravity.LEFT;
+            lp.leftMargin = initLeft;
             lp.topMargin = (int) (150 * d);
-            lp.rightMargin = (int) (14 * d);
             root.addView(fab, lp);
+            log(4, TAG, "fab placed at left=" + initLeft + " scrW=" + scrW);
 
             // 拖动 + 点击
             fab.setOnTouchListener(new View.OnTouchListener() {
@@ -1125,11 +1134,12 @@ public class HookEntry extends XposedModule {
                         case android.view.MotionEvent.ACTION_CANCEL: {
                             v.animate().scaleX(1f).scaleY(1f).setDuration(80).start();
                             if (moved) {
-                                // 吸附到左右边缘
+                                // 吸附到左右边缘（用屏幕宽度，不用 root.getWidth）
                                 FrameLayout.LayoutParams up = (FrameLayout.LayoutParams) v.getLayoutParams();
-                                int w = root.getWidth();
-                                boolean right = up.leftMargin + v.getWidth() / 2 > w / 2;
-                                up.leftMargin = right ? (w - v.getWidth() - (int) (10 * d)) : (int) (10 * d);
+                                int w = scrW > 0 ? scrW : root.getWidth();
+                                int fw = v.getWidth() > 0 ? v.getWidth() : size;
+                                boolean right = up.leftMargin + fw / 2 > w / 2;
+                                up.leftMargin = right ? (w - fw - (int) (10 * d)) : (int) (10 * d);
                                 v.setLayoutParams(up);
                             } else {
                                 onFabClick(ctx);
@@ -1533,7 +1543,110 @@ public class HookEntry extends XposedModule {
         return sb.toString();
     }
 
+    /** 跨进程读模块 prefs：getRemotePreferences 在宿主进程返回空 Map，改用 openRemoteFile 直接读 XML */
+    private java.util.Map<String, Object> readRemotePrefs() {
+        java.util.Map<String, Object> out = new java.util.HashMap<>();
+        // １）优先走 ContentProvider（SELinux 会拦跨 uid 读文件，chmod 无效）
+        try {
+            android.content.Context c = appCtx();
+            if (c != null) {
+                android.database.Cursor cu = c.getContentResolver().query(
+                        android.net.Uri.parse("content://com.fj.dyhd.pref/pref"),
+                        null, null, null, null);
+                if (cu != null) {
+                    while (cu.moveToNext()) {
+                        String k = cu.getString(0);
+                        String t = cu.getString(1);
+                        String v = cu.getString(2);
+                        if (k == null) continue;
+                        try {
+                            if ("boolean".equals(t)) out.put(k, Boolean.parseBoolean(v));
+                            else if ("long".equals(t)) out.put(k, Long.parseLong(v));
+                            else if ("int".equals(t)) out.put(k, Integer.parseInt(v));
+                            else if ("float".equals(t)) out.put(k, Float.parseFloat(v));
+                            else out.put(k, v);
+                        } catch (Throwable ignored) {}
+                    }
+                    cu.close();
+                }
+            }
+        } catch (Throwable t3) {
+            log(5, TAG, "pref provider fail " + t3);
+        }
+        if (!out.isEmpty()) {
+            log(4, TAG, "prefs via provider, keys=" + out.size()
+                    + " longSkipSec=" + out.get("longSkipSec"));
+            return out;
+        } else {
+            log(5, TAG, "prefs provider empty (ctx=" + (appCtx() != null) + ")");
+        }
+
+        java.io.FileInputStream fis = null;
+        try {
+            // provider 不行时退回直接读文件
+            // 需要模块侧把 dyhd.xml chmod 644
+            String[] paths = {
+                    "/data/user/0/com.fj.dyhd/shared_prefs/" + PREF + ".xml",
+                    "/data/data/com.fj.dyhd/shared_prefs/" + PREF + ".xml"
+            };
+            for (String path : paths) {
+                try {
+                    fis = new java.io.FileInputStream(path);
+                    break;
+                } catch (Throwable ignored) { fis = null; }
+            }
+            if (fis == null) {
+                log(5, TAG, "prefs file unreadable, fallback to remote API");
+                try {
+                    android.content.SharedPreferences rp = getRemotePreferences(PREF);
+                    if (rp != null) {
+                        for (java.util.Map.Entry<String, ?> e : rp.getAll().entrySet()) out.put(e.getKey(), e.getValue());
+                    }
+                } catch (Throwable ignored) {}
+                return out;
+            }
+            org.xmlpull.v1.XmlPullParser xp = android.util.Xml.newPullParser();
+            xp.setInput(fis, "UTF-8");
+            String curName = null, curType = null;
+            for (int ev = xp.getEventType(); ev != org.xmlpull.v1.XmlPullParser.END_DOCUMENT; ev = xp.next()) {
+                if (ev == org.xmlpull.v1.XmlPullParser.START_TAG) {
+                    String tag = xp.getName();
+                    curName = xp.getAttributeValue(null, "name");
+                    curType = tag;
+                    String val = xp.getAttributeValue(null, "value");
+                    if (curName != null && val != null) {
+                        if ("boolean".equals(tag)) out.put(curName, Boolean.parseBoolean(val));
+                        else if ("long".equals(tag)) { try { out.put(curName, Long.parseLong(val)); } catch (Throwable ignored) {} }
+                        else if ("int".equals(tag)) { try { out.put(curName, Integer.parseInt(val)); } catch (Throwable ignored) {} }
+                        else if ("float".equals(tag)) { try { out.put(curName, Float.parseFloat(val)); } catch (Throwable ignored) {} }
+                        else if ("string".equals(tag)) out.put(curName, val);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            log(5, TAG, "readRemotePrefs fail " + t);
+        } finally {
+            try { if (fis != null) fis.close(); } catch (Throwable ignored) {}
+
+        }
+        return out;
+    }
+
+    private static volatile java.util.Map<String, Object> sPrefCache = null;
+    private static volatile long sPrefCacheTs = 0L;
+
+    private java.util.Map<String, Object> prefs() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        java.util.Map<String, Object> c = sPrefCache;
+        if (c != null && now - sPrefCacheTs < 3000) return c;
+        java.util.Map<String, Object> m = readRemotePrefs();
+        sPrefCache = m; sPrefCacheTs = now;
+        return m;
+    }
+
     private boolean prefOn(String key, boolean def) {
+        Object v = prefs().get(key);
+        if (v instanceof Boolean) return (Boolean) v;
         try {
             android.content.SharedPreferences p = getRemotePreferences(PREF);
             if (p != null) return p.getBoolean(key, def);
@@ -1615,6 +1728,205 @@ public class HookEntry extends XposedModule {
         } catch (Throwable t) {
             log(5, TAG, "conflict check fail " + t);
         }
+    }
+
+    private boolean isAdBlockEnabled()  { return prefOn("adBlock",  true); }
+    private boolean isLiveSkipEnabled() { return prefOn("liveSkip", true); }
+    /** 长视频跳过阈值（秒）：0 = 不限制；60 = 超过 1 分钟跳 */
+    private long longSkipSeconds()      { return prefOnLong("longSkipSec", 0L); }
+    private boolean isLongSkipEnabled() { return prefOn("longSkip", true) && longSkipSeconds() > 0; }
+
+    /** 抖音里稍微长一点的视频就自动画过去（单位：秒） */
+    private long prefOnLong(String key, long def) {
+        Object v = prefs().get(key);
+        if (v instanceof Long) return (Long) v;
+        if (v instanceof Integer) return ((Integer) v).longValue();
+        return def;
+    }
+
+    /** 对当前视频做广告/直播/长视频检测，命中就自动上滑 */
+    private static volatile long sLastProbeTs = 0L;
+
+    private void checkAndSkipFeed(Object aweme) {
+        if (aweme == null) return;
+        boolean ad = isAdBlockEnabled();
+        boolean live = isLiveSkipEnabled();
+        boolean longV = isLongSkipEnabled();
+        if (!ad && !live && !longV) return;
+
+        String why = null;
+        try {
+            if (live && boolCall(aweme, "isLive")) why = "live";
+        } catch (Throwable ignored) {}
+        if (why == null && ad) {
+            try {
+                if (boolCall(aweme, "isAd")) why = "ad(isAd)";
+                else if (boolCall(aweme, "isCommerce")) why = "ad(isCommerce)";
+                else if (boolCall(aweme, "isAdTraffic")) why = "ad(isAdTraffic)";
+                else if (boolCall(aweme, "isSoftAd")) why = "ad(isSoftAd)";
+            } catch (Throwable ignored) {}
+        }
+        if (why == null && longV) {
+            try {
+                Object video = getVideo(aweme);
+                if (video != null) {
+                    long dur = videoDuration(video);
+                    long limitMs = longSkipSeconds() * 1000L;
+                    if (dur > 0 && dur > limitMs) {
+                        why = "long(" + (dur / 1000) + "s>" + (limitMs / 1000) + "s)";
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        if (why == null) {
+            // 诊断：每 3 秒最多一条，看真实字段值
+            long t = android.os.SystemClock.elapsedRealtime();
+            if (t - sLastProbeTs > 3000) {
+                sLastProbeTs = t;
+                long dur = 0; boolean lv = false, adf = false;
+                String vinfo = "null";
+                try { lv = boolCall(aweme, "isLive"); } catch (Throwable ignored) {}
+                try { adf = boolCall(aweme, "isAd"); } catch (Throwable ignored) {}
+                try {
+                    Object v = getVideo(aweme);
+                    if (v != null) {
+                        dur = longCall(v, "getDuration");
+                        vinfo = v.getClass().getSimpleName() + "/dur=" + dur;
+                        if (dur == 0) {
+                            // 列出 Video 里所有返回数字的方法名 + 数字字段名，便于找真正的 duration
+                            StringBuilder ms = new StringBuilder();
+                            for (Method mm2 : v.getClass().getDeclaredMethods()) {
+                                if (mm2.getParameterCount() != 0) continue;
+                                Class<?> rt2 = mm2.getReturnType();
+                                if (rt2 == long.class || rt2 == int.class) {
+                                    try {
+                                        Object r2 = mm2.invoke(v);
+                                        long lv2 = r2 instanceof Number ? ((Number) r2).longValue() : 0;
+                                        if (lv2 > 0) ms.append(mm2.getName()).append('=').append(lv2).append(',');
+                                    } catch (Throwable ignored) {}
+                                }
+                            }
+                            StringBuilder fs = new StringBuilder();
+                            long best = 0; String bestName = null;
+                            for (Field f2 : v.getClass().getDeclaredFields()) {
+                                if (f2.getType() == long.class || f2.getType() == int.class) {
+                                    try {
+                                        f2.setAccessible(true);
+                                        long lv2 = f2.getLong(v);
+                                        if (lv2 > 0) {
+                                            fs.append(f2.getName()).append('=').append(lv2).append(',');
+                                            // 时长特征：1000ms ~ 30min 范围，取最接近常见视频时长的
+                                            if (lv2 >= 1000 && lv2 <= 1800000 && lv2 > best) {
+                                                best = lv2; bestName = f2.getName();
+                                            }
+                                        }
+                                    } catch (Throwable ignored) {}
+                                }
+                            }
+                            if (best > 0) { dur = best; vinfo += "/picked:" + bestName + "=" + best; }
+                            vinfo += "/m[" + ms + "]/f[" + fs + "]";
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                // prefs 诊断
+                int prefCnt = -1;
+                try {
+                    android.content.SharedPreferences pp = getRemotePreferences(PREF);
+                    if (pp != null) prefCnt = pp.getAll() == null ? -2 : pp.getAll().size();
+                } catch (Throwable ignored) {}
+                log(4, TAG, "feed probe live=" + lv + " ad=" + adf
+                        + " dur=" + dur + "ms limitMin=" + longSkipSeconds()
+                        + " v=" + vinfo + " prefKeys=" + prefCnt);
+            }
+            return;
+        }
+
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - sLastFeedSkipTs < 1200) return;   // 防连滑
+        sLastFeedSkipTs = now;
+        log(4, TAG, "feed skip: " + why);
+        swipeToNext();
+    }
+
+    private static volatile long sLastFeedSkipTs = 0L;
+
+    /** 反射调 boolean 无参方法，不存在时返回 false */
+    private static boolean boolCall(Object o, String name) {
+        if (o == null) return false;
+        try {
+            Method m = o.getClass().getMethod(name);
+            Object r = m.invoke(o);
+            return r instanceof Boolean && (Boolean) r;
+        } catch (Throwable ignored) { return false; }
+    }
+
+    /** 取视频时长（ms）：getDuration 失效时扫混淆字段 */
+    private static long videoDuration(Object video) {
+        if (video == null) return 0L;
+        long d = longCall(video, "getDuration");
+        if (d > 0) return d;
+        long best = 0;
+        try {
+            Class<?> c = video.getClass();
+            while (c != null && c != Object.class) {
+                for (Field f : c.getDeclaredFields()) {
+                    if (f.getType() == long.class || f.getType() == int.class) {
+                        try {
+                            f.setAccessible(true);
+                            long v = f.getLong(video);
+                            // 时长特征：1s ~ 30min
+                            if (v >= 1000 && v <= 1800000 && v > best) best = v;
+                        } catch (Throwable ignored) {}
+                    }
+                }
+                c = c.getSuperclass();
+            }
+        } catch (Throwable ignored) {}
+        return best;
+    }
+
+    /** 反射调 long 无参方法，失败返回 0 */
+    private static long longCall(Object o, String name) {
+        if (o == null) return 0L;
+        try {
+            Method m = o.getClass().getMethod(name);
+            Object r = m.invoke(o);
+            if (r instanceof Number) return ((Number) r).longValue();
+        } catch (Throwable ignored) {}
+        return 0L;
+    }
+
+    /** 宿主进程的 Application Context */
+    private static volatile android.content.Context sAppCtx = null;
+
+    private static android.content.Context appCtx() {
+        android.content.Context c = sAppCtx;
+        if (c != null) return c;
+        // Activity 优先（hook 里拿得到，比 currentApplication 稳）
+        try {
+            android.app.Activity a = sCurActivity;
+            if (a != null) { sAppCtx = a.getApplicationContext(); return sAppCtx; }
+        } catch (Throwable ignored) {}
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object o = at.getMethod("currentApplication").invoke(null);
+            if (o instanceof android.content.Context) {
+                sAppCtx = (android.content.Context) o;
+                return sAppCtx;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object o = at.getMethod("currentActivityThread").invoke(null);
+            java.lang.reflect.Field f = at.getDeclaredField("mInitialApplication");
+            f.setAccessible(true);
+            Object app = f.get(o);
+            if (app instanceof android.content.Context) {
+                sAppCtx = (android.content.Context) app;
+                return sAppCtx;
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     private boolean isEnabled() {

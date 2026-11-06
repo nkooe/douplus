@@ -1,7 +1,7 @@
 id=DouPlus
 name=抖plus
-version=v9.8
-versionCode=63
+version=v10.9
+versionCode=74
 author=fj
 description=抖音无水印下载 + 首页悬浮球 + 动图转MP4静图转JPG + 自动下一个
 minApiVersion=101
