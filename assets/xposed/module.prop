@@ -1,0 +1,10 @@
+id=DouPlus
+name=抖plus
+version=v8.8
+versionCode=53
+author=fj
+description=抖音无水印下载 + 首页悬浮球 + 动图转MP4静图转JPG + 自动下一个
+minApiVersion=101
+targetApiVersion=102
+staticScope=true
+autoHotReload=false
