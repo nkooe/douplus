@@ -1612,8 +1612,6 @@ public class HookEntry extends XposedModule {
             log(4, TAG, "prefs via provider, keys=" + out.size()
                     + " longSkipSec=" + out.get("longSkipSec"));
             return out;
-        } else {
-            log(5, TAG, "prefs provider empty (ctx=" + (appCtx() != null) + ")");
         }
 
         java.io.FileInputStream fis = null;
@@ -1670,12 +1668,39 @@ public class HookEntry extends XposedModule {
     private static volatile java.util.Map<String, Object> sPrefCache = null;
     private static volatile long sPrefCacheTs = 0L;
 
+    private static volatile int sPrefFailCount = 0;
+    private static volatile long sPrefBackoffTs = 0L;
+    private static final java.util.Map<String, Object> EMPTY_PREFS =
+            java.util.Collections.unmodifiableMap(new java.util.HashMap<String, Object>());
+
     private java.util.Map<String, Object> prefs() {
         long now = android.os.SystemClock.elapsedRealtime();
+
+        // 退避中：直接用上一次的缓存（或空），不再打扰 provider
+        if (now < sPrefBackoffTs) {
+            return sPrefCache != null ? sPrefCache : EMPTY_PREFS;
+        }
+
         java.util.Map<String, Object> c = sPrefCache;
-        if (c != null && now - sPrefCacheTs < 3000) return c;
+        if (c != null && !c.isEmpty() && now - sPrefCacheTs < 3000) return c;
+
         java.util.Map<String, Object> m = readRemotePrefs();
-        sPrefCache = m; sPrefCacheTs = now;
+
+        // 只缓存非空结果：抖音冷启动初期 provider 可能还未就绪，
+        // 返回空 Map 时不能缓存，否则 3 秒内都读不到用户设置
+        if (!m.isEmpty()) {
+            sPrefCache = m;
+            sPrefCacheTs = now;
+            sPrefFailCount = 0;
+            return m;
+        }
+
+        // 连续失败退避：避免每刷一条视频都查 3 次 provider
+        if (++sPrefFailCount >= 5) {
+            sPrefFailCount = 0;
+            sPrefBackoffTs = now + 10000L;
+            log(4, TAG, "prefs unavailable, backoff 10s");
+        }
         return m;
     }
 
