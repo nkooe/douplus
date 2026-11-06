@@ -913,6 +913,9 @@ public class HookEntry extends XposedModule {
 
     /** 追踪当前前台 Activity，供自动播放/滑动手势使用 */
     private void hookActivityTracker(ClassLoader cl) {
+        // 接收器需要 Context，等 Activity 起来后再注册
+        android.os.Handler h0 = new android.os.Handler(android.os.Looper.getMainLooper());
+        h0.postDelayed(new Runnable() { @Override public void run() { registerConfigReceiver(); } }, 1500);
         try {
             final Method onResume = android.app.Activity.class.getDeclaredMethod("onResume");
             hook(onResume).setId("dyhd-act-resume").intercept(new XposedInterface.Hooker() {
@@ -1793,8 +1796,8 @@ public class HookEntry extends XposedModule {
     private boolean isAdBlockEnabled()  { return prefOn("adBlock",  true); }
     private boolean isLiveSkipEnabled() { return prefOn("liveSkip", true); }
     /** 长视频跳过阈值（秒）：0 = 不限制；60 = 超过 1 分钟跳 */
-    private long longSkipSeconds()      { return prefOnLong("longSkipSec", 0L); }
-    private boolean isLongSkipEnabled() { return prefOn("longSkip", true) && longSkipSeconds() > 0; }
+    private long longSkipSeconds()      { return prefOnLong("longSkipSec", 60L); }
+    private boolean isLongSkipEnabled() { return prefOn("longSkip", true); }
 
     /** 抖音里稍微长一点的视频就自动画过去（单位：秒） */
     private long prefOnLong(String key, long def) {
@@ -1991,7 +1994,7 @@ public class HookEntry extends XposedModule {
                     }
                 } catch (Throwable ignored) {}
                 log(4, TAG, "feed probe live=" + lv + " ad=" + adf
-                        + " dur=" + dur + "ms limitMin=" + longSkipSeconds()
+                        + " dur=" + dur + "ms limitSec=" + longSkipSeconds()
                         + " v=" + vinfo + " prefKeys=" + prefCnt);
             }
             return;
@@ -2056,6 +2059,55 @@ public class HookEntry extends XposedModule {
             if (r instanceof Number) return ((Number) r).longValue();
         } catch (Throwable ignored) {}
         return 0L;
+    }
+
+    /* ============ 跨进程配置：广播通道 ============ */
+
+    private static final String ACTION_CONFIG = "com.fj.dyhd.CONFIG";
+    private static volatile boolean sReceiverReady = false;
+
+    private void registerConfigReceiver() {
+        if (sReceiverReady) return;
+        try {
+            android.content.Context ctx = appCtx();
+            if (ctx == null) { log(5, TAG, "config receiver: no ctx"); return; }
+            android.content.IntentFilter f =
+                    new android.content.IntentFilter(ACTION_CONFIG);
+            android.content.BroadcastReceiver r = new android.content.BroadcastReceiver() {
+                @Override public void onReceive(android.content.Context c,
+                                                android.content.Intent intent) {
+                    try {
+                        String kv = intent.getStringExtra("kv");
+                        if (kv == null) return;
+                        org.json.JSONObject o = new org.json.JSONObject(kv);
+                        java.util.Map<String, Object> m = new java.util.HashMap<>();
+                        java.util.Iterator<String> it = o.keys();
+                        while (it.hasNext()) {
+                            String k = it.next();
+                            Object v = o.opt(k);
+                            if (v instanceof Boolean) m.put(k, v);
+                            else if (v instanceof Number) m.put(k, ((Number) v).longValue());
+                            else if (v != null) m.put(k, String.valueOf(v));
+                        }
+                        if (!m.isEmpty()) {
+                            sPrefCache = m;
+                            sPrefCacheTs = android.os.SystemClock.elapsedRealtime();
+                            sPrefBackoffTs = 0L;
+                            sPrefFailCount = 0;
+                            log(4, TAG, "config received: " + m);
+                        }
+                    } catch (Throwable t) { log(5, TAG, "config parse fail " + t); }
+                }
+            };
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                ctx.registerReceiver(r, f, null, null,
+                        android.content.Context.RECEIVER_EXPORTED);
+            } else {
+                ctx.registerReceiver(r, f);
+            }
+            sReceiverReady = true;
+            log(4, TAG, "config receiver registered");
+        } catch (Throwable t) { log(5, TAG, "config receiver fail " + t); }
     }
 
     /** 宿主进程的 Application Context */

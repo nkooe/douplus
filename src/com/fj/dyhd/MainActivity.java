@@ -65,46 +65,65 @@ public class MainActivity extends Activity {
         return t;
     }
 
-    private long longSkipSeconds() { return getSharedPreferences(PREF, MODE_PRIVATE).getLong("longSkipSec", 0L); }
+    private long longSkipSeconds() { return getSharedPreferences(PREF, MODE_PRIVATE).getLong("longSkipSec", 60L); }
 
     private String longSkipValueText() {
-        long m = longSkipSeconds();
-        return m <= 0 ? "已关闭" : (m + " 分钟");
+        return longSkipSeconds() + " 秒";
     }
 
     private String longSkipSummary() {
-        long m = longSkipSeconds();
-        if (m <= 0) return "关闭，不跳过任何视频";
-        return "超过 " + m + " 分钟的视频自动划过";
+        return "超过 " + longSkipSeconds() + " 秒的视频自动划过";
     }
 
     private void editLongSkip() {
         final EditText et = new EditText(this);
         et.setInputType(InputType.TYPE_CLASS_NUMBER);
         et.setText(String.valueOf(longSkipSeconds()));
-        et.setHint("0 = 关闭，1 = 1 分钟，10 = 10 分钟");
+        et.setHint("单位：秒（60 = 1 分钟，600 = 10 分钟）");
         et.setTextSize(15f);
         et.setPadding((int) dp(12), (int) dp(8), (int) dp(12), (int) dp(8));
 
         new AlertDialog.Builder(this)
                 .setTitle("长视频跳过")
-                .setMessage("0 = 关闭\n1 = 超过 1 分钟自动跳\n10 = 超过 10 分钟自动跳")
+                .setMessage("单位：秒\n60 = 超过 1 分钟自动跳\n600 = 超过 10 分钟自动跳\n\n开启或关闭请用上面的开关")
                 .setView(et)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int w) {
-                        long m = 0;
+                        long m = 60;
                         try { m = Long.parseLong(et.getText().toString().trim()); } catch (Throwable ignored) {}
-                        if (m < 0) m = 0;
+                        if (m <= 0) m = 60;          // 0 不表示关闭，回落默认 60 秒
                         if (m > 36000) m = 36000;
                         getSharedPreferences(PREF, MODE_PRIVATE).edit().putLong("longSkipSec", m).commit();
-                        makePrefsReadable();
+                        pushConfig();
                     }
                 })
                 .show();
     }
 
-    /** 让宿主进程（抖音）能读到模块的 prefs 文件 */
+    /** 把配置推给抖音进程。
+     *  跨进程读文件被 SELinux 拦，provider 又会被系统冻结，广播最稳。 */
+    private void pushConfig() {
+        makePrefsReadable();
+        try {
+            android.content.SharedPreferences p = getSharedPreferences(PREF, MODE_PRIVATE);
+            org.json.JSONObject o = new org.json.JSONObject();
+            for (java.util.Map.Entry<String, ?> e : p.getAll().entrySet()) {
+                o.put(e.getKey(), e.getValue());
+            }
+            android.content.Intent it = new android.content.Intent(ACTION_CONFIG);
+            it.setPackage("com.ss.android.ugc.aweme");
+            it.putExtra("kv", o.toString());
+            sendBroadcast(it);
+            android.util.Log.i("DYHD", "pushConfig: " + o);
+        } catch (Throwable t) {
+            android.util.Log.e("DYHD", "pushConfig fail " + t);
+        }
+    }
+
+    public static final String ACTION_CONFIG = "com.fj.dyhd.CONFIG";
+
+    /** 让宿主进程（抖音）能读到模块的 prefs 文件（保留作兜底） */
     private void makePrefsReadable() {
         try {
             java.io.File f = new java.io.File(getApplicationInfo().dataDir
@@ -121,7 +140,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         final SharedPreferences sp = getSharedPreferences(PREF, MODE_PRIVATE);
-        makePrefsReadable();
+        pushConfig();
 
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(BG);
@@ -166,7 +185,7 @@ public class MainActivity extends Activity {
             {"autoPlay", "自动播放",   "当前视频播完自动下一个"},
             {"adBlock",  "屏蔽广告",   "刷到广告自动划过"},
             {"liveSkip", "直播跳过",   "刷到直播自动划过"},
-            {"longSkip", "长视频跳过", "长按本行设置时长（秒）"}
+            {"longSkip", "长视频跳过", "长按本行设置阀值（秒）"}
         };
         for (int i = 0; i < switches.length; i++) {
             final String key = switches[i][0];
@@ -192,7 +211,7 @@ public class MainActivity extends Activity {
                 @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean v) {
                     boolean ok = sp.edit().putBoolean(key, v).commit();
                     android.util.Log.i("DYHD", "pref " + key + "=" + v + " commit=" + ok);
-                    makePrefsReadable();
+                    pushConfig();
                 }
             });
             sw.setOnClickListener(new View.OnClickListener() {
@@ -202,7 +221,7 @@ public class MainActivity extends Activity {
                     if (sp.getBoolean(key, true) != v) {
                         boolean ok = sp.edit().putBoolean(key, v).commit();
                         android.util.Log.i("DYHD", "pref(clk) " + key + "=" + v + " commit=" + ok);
-                        makePrefsReadable();
+                        pushConfig();
                     }
                 }
             });
