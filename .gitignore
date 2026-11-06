@@ -1,0 +1,12 @@
+build/
+out/
+*.apk
+*.apk.idsig
+*.dex
+*.class
+*.jar
+*.md
+*.py
+__pycache__/
+*.log
+*.db
