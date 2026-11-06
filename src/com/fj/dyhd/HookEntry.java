@@ -59,6 +59,7 @@ public class HookEntry extends XposedModule {
         hookDialogEmoji(cl);
         hookActivityTracker(cl);
         hookAutoPlay(cl);
+        hookAdLabel(cl);
         // 原生菜单项已停用（悬浮球已足够）
         hookAwemeDesc(cl);
         log(4, TAG, "init addr=" + a + " panel=" + b + " comment=" + c);
@@ -1036,6 +1037,40 @@ public class HookEntry extends XposedModule {
         } catch (Throwable t) { log(5, TAG, "aweme hook fail " + t); }
     }
 
+    /* ============ 5c) 广告标签检测（依赖 UI 文本，不依赖 Aweme 字段） ============ */
+
+    private void hookAdLabel(ClassLoader cl) {
+        try {
+            Method m = TextView.class.getDeclaredMethod("setText", CharSequence.class);
+            hook(m).setId("dyhd-adlabel").intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) {
+                    Object ret = chain.proceed();
+                    try {
+                        if (!isAdBlockEnabled()) return ret;
+                        Object arg = chain.getArg(0);
+                        if (!(arg instanceof CharSequence)) return ret;
+                        CharSequence cs = (CharSequence) arg;
+                        int len = cs.length();
+                        if (len == 0 || len > 4) return ret;
+                        String t = cs.toString();
+                        // 抖音广告标签：「广告」「广告·推广」等
+                        boolean isAd = "广告".equals(t)
+                                || "广告·推广".equals(t)
+                                || "关注广告".equals(t);
+                        if (!isAd) return ret;
+                        long now = android.os.SystemClock.elapsedRealtime();
+                        if (now - sLastFeedSkipTs < 2000) return ret;
+                        sLastFeedSkipTs = now;
+                        log(4, TAG, "ad label detected: " + t + " -> swipe");
+                        swipeToNext();
+                    } catch (Throwable ignored) {}
+                    return ret;
+                }
+            });
+            log(4, TAG, "ad label hook installed");
+        } catch (Throwable t) { log(5, TAG, "ad label hook fail " + t); }
+    }
+
     /* ============ 6b) 首页悬浮球 ============ */
 
     private static final String MARK_FAB = "fj_dyhd_fab";
@@ -1760,7 +1795,13 @@ public class HookEntry extends XposedModule {
         } catch (Throwable ignored) {}
         if (why == null && ad) {
             try {
-                if (boolCall(aweme, "isAd")) why = "ad(isAd)";
+                // 实测命中的抖音广告标记（电商商品卡）：
+                //   getAd()=true，getIsAdAweme()=true，adAwemeSource=2
+                if (boolCall(aweme, "getAd")) why = "ad(getAd)";
+                else if (boolCall(aweme, "getIsAdAweme")) why = "ad(getIsAdAweme)";
+                else if (longCall(aweme, "getAdAwemeSource") > 0) {
+                    why = "ad(source=" + longCall(aweme, "getAdAwemeSource") + ")";
+                } else if (boolCall(aweme, "isAd")) why = "ad(isAd)";
                 else if (boolCall(aweme, "isCommerce")) why = "ad(isCommerce)";
                 else if (boolCall(aweme, "isAdTraffic")) why = "ad(isAdTraffic)";
                 else if (boolCall(aweme, "isSoftAd")) why = "ad(isSoftAd)";
@@ -1834,12 +1875,107 @@ public class HookEntry extends XposedModule {
                     android.content.SharedPreferences pp = getRemotePreferences(PREF);
                     if (pp != null) prefCnt = pp.getAll() == null ? -2 : pp.getAll().size();
                 } catch (Throwable ignored) {}
+                // 临时：dump 所有返回 true 的 boolean 方法，用来找广告标记
+                StringBuilder tb = new StringBuilder();
+                try {
+                    for (Method bm : aweme.getClass().getDeclaredMethods()) {
+                        if (bm.getParameterCount() != 0) continue;
+                        if (bm.getReturnType() != boolean.class) continue;
+                        try {
+                            Object r = bm.invoke(aweme);
+                            if (Boolean.TRUE.equals(r)) tb.append(bm.getName()).append(',');
+                        } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable ignored) {}
+                // 字符串字段里找 ad/广告 线索
+                StringBuilder sf = new StringBuilder();
+                try {
+                    Class<?> ac = aweme.getClass();
+                    while (ac != null && ac != Object.class) {
+                        for (Field af : ac.getDeclaredFields()) {
+                            if (af.getType() == String.class) {
+                                try {
+                                    af.setAccessible(true);
+                                    Object v2 = af.get(aweme);
+                                    if (v2 != null) {
+                                        String sv = v2.toString();
+                                        if (sv.length() < 60 && (sv.contains("ad") || sv.contains("Ad") || sv.contains("广告"))) {
+                                            sf.append(af.getName()).append('=').append(sv).append(' ');
+                                        }
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                        }
+                        ac = ac.getSuperclass();
+                    }
+                } catch (Throwable ignored) {}
+                // 所有非空对象字段（广告标记很可能是 adInfo/commerceInfo 这类对象）
+                StringBuilder of = new StringBuilder();
+                try {
+                    Class<?> oc2 = aweme.getClass();
+                    while (oc2 != null && oc2 != Object.class) {
+                        for (Field of2 : oc2.getDeclaredFields()) {
+                            Class<?> ot = of2.getType();
+                            if (ot.isPrimitive() || ot == String.class) continue;
+                            try {
+                                of2.setAccessible(true);
+                                Object ov = of2.get(aweme);
+                                if (ov != null) {
+                                    String on = of2.getName();
+                                    String cn2 = ot.getSimpleName();
+                                    if (on.length() <= 3) on = "(" + cn2 + ")" + on;
+                                    of.append(on).append(':').append(cn2).append(',');
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                        oc2 = oc2.getSuperclass();
+                    }
+                } catch (Throwable ignored) {}
+                // 名字含 ad 的所有方法及返回值
+                StringBuilder meth = new StringBuilder();
+                String[] adGetters = {"getAdOrderId", "getAdLinkType", "getAdAwemeSource",
+                        "getAdChargeConfig", "getAdSchedule", "isAd", "isCommerce",
+                        "getAdInfo", "getCommerceInfo", "getPromotionInfo"};
+                for (String gn : adGetters) {
+                    try {
+                        Method gm = aweme.getClass().getMethod(gn);
+                        Object rv = gm.invoke(aweme);
+                        if (rv == null) continue;
+                        String sv2 = String.valueOf(rv);
+                        if ("0".equals(sv2) || "".equals(sv2) || "false".equals(sv2)) continue;
+                        meth.append(gn).append('=').append(sv2).append(',');
+                    } catch (Throwable ignored) {}
+                }
+                // 扫 Aweme 的数字字段，找 adType/adSource 这类广告类型标识
+                StringBuilder nf = new StringBuilder();
+                try {
+                    Class<?> nc = aweme.getClass();
+                    while (nc != null && nc != Object.class) {
+                        for (Field nfd : nc.getDeclaredFields()) {
+                            if (nfd.getType() != int.class && nfd.getType() != long.class) continue;
+                            String fn2 = nfd.getName().toLowerCase();
+                            if (!(fn2.contains("ad") || fn2.contains("commerce")
+                                    || fn2.contains("promo") || fn2.contains("shop"))) continue;
+                            try {
+                                nfd.setAccessible(true);
+                                long nv = nfd.getLong(aweme);
+                                if (nv != 0) nf.append(nfd.getName()).append('=').append(nv).append(',');
+                            } catch (Throwable ignored) {}
+                        }
+                        nc = nc.getSuperclass();
+                    }
+                } catch (Throwable ignored) {}
                 log(4, TAG, "feed probe live=" + lv + " ad=" + adf
                         + " dur=" + dur + "ms limitMin=" + longSkipSeconds()
                         + " v=" + vinfo + " prefKeys=" + prefCnt);
             }
             return;
         }
+
+        // 同一个 aweme 只跳一次（抖音划走后仍会反复调 getDesc）
+        Object lastSkipped = sLastSkippedAweme;
+        if (lastSkipped != null && (lastSkipped == aweme || lastSkipped.equals(aweme))) return;
+        sLastSkippedAweme = aweme;
 
         long now = android.os.SystemClock.elapsedRealtime();
         if (now - sLastFeedSkipTs < 1200) return;   // 防连滑
@@ -1849,6 +1985,7 @@ public class HookEntry extends XposedModule {
     }
 
     private static volatile long sLastFeedSkipTs = 0L;
+    private static volatile Object sLastSkippedAweme = null;
 
     /** 反射调 boolean 无参方法，不存在时返回 false */
     private static boolean boolCall(Object o, String name) {
