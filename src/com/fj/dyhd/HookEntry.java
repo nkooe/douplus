@@ -6,6 +6,7 @@ import android.os.Environment;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.FrameLayout;
 import android.widget.TextView;
@@ -60,6 +61,7 @@ public class HookEntry extends XposedModule {
         hookNativeMenuItem(cl);
         hookAwemeDesc(cl);
         log(4, TAG, "init addr=" + a + " panel=" + b + " comment=" + c);
+        checkModuleConflicts();
     }
 
     /* ============ 1) 长按面板注入按钮 ============ */
@@ -1257,33 +1259,73 @@ public class HookEntry extends XposedModule {
 
         final Context ctx = anchor.getContext();
 
-        // 复制 anchor 的结构：若是容器则逐个复制子 View 的样式，否则直接造 TextView
+        final float d = ctx.getResources().getDisplayMetrics().density;
+
+        // 圆角背景，贴近抖音卡片风格
         LinearLayout item = new LinearLayout(ctx);
         item.setTag(mark);
         item.setOrientation(LinearLayout.HORIZONTAL);
         item.setGravity(Gravity.CENTER_VERTICAL);
-        if (anchor instanceof View) {
-            item.setPadding(anchor.getPaddingLeft(), anchor.getPaddingTop(),
-                    anchor.getPaddingRight(), anchor.getPaddingBottom());
-        }
+        item.setPadding((int) (18 * d), (int) (15 * d), (int) (18 * d), (int) (15 * d));
         item.setClickable(true);
         item.setFocusable(true);
+        item.setClipToOutline(false);
+        android.graphics.drawable.GradientDrawable bg =
+                new android.graphics.drawable.GradientDrawable();
+        bg.setColor(0xFF2C2C31);
+        bg.setCornerRadius(14 * d);
+        item.setBackground(bg);
 
-        // 图标：用一个箭头样式的 TextView 占位，尺寸跟随 anchor
-        TextView icon = new TextView(ctx);
-        icon.setText("\u2193");
-        icon.setTextSize(17f);
-        icon.setTextColor(0xFFF2F4F8);
-        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        ilp.rightMargin = (int) (10 * ctx.getResources().getDisplayMetrics().density);
-        item.addView(icon, ilp);
+        // 图标：用模块自带的下载 vector
+        ImageView icon = new ImageView(ctx);
+        try {
+            Context mctx = ctx.createPackageContext("com.fj.dyhd",
+                    Context.CONTEXT_IGNORE_SECURITY | Context.CONTEXT_INCLUDE_CODE);
+            // 必须用模块自己的 Resources 取 Drawable
+            // 直接 setImageResource(rid) 会用宿主的 Resources 解析，找不到该 ID
+            android.content.res.Resources mres = mctx.getResources();
+            int rid = mres.getIdentifier("ic_dl", "drawable", "com.fj.dyhd");
+            if (rid != 0) {
+                android.graphics.drawable.Drawable dw = mres.getDrawable(rid, null);
+                icon.setImageDrawable(dw);
+                log(4, TAG, "dl icon loaded via module res, id=" + rid
+                        + " dw=" + (dw != null));
+            } else {
+                log(5, TAG, "dl icon resId=0, fallback");
+            }
+        } catch (Throwable t) {
+            TextView fallback = new TextView(ctx);
+            fallback.setText("\u2193");
+            fallback.setTextSize(17f);
+            fallback.setTextColor(0xFF25F4EE);
+            LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(
+                    (int) (22 * d), (int) (22 * d));
+            flp.rightMargin = (int) (12 * d);
+            item.addView(fallback, flp);
+            icon = null;
+        }
+        if (icon != null) {
+            LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(
+                    (int) (24 * d), (int) (24 * d));
+            ilp.rightMargin = (int) (13 * d);
+            item.addView(icon, ilp);
+        }
 
         TextView label = new TextView(ctx);
         label.setText("高画质下载");
         label.setTextSize(15f);
         label.setTextColor(0xFFF2F4F8);
         item.addView(label);
+
+        // 右侧副标题
+        TextView hint = new TextView(ctx);
+        hint.setText("无水印");
+        hint.setTextSize(12f);
+        hint.setTextColor(0xFF8A8A90);
+        LinearLayout.LayoutParams hlp2 = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hlp2.leftMargin = (int) (10 * d);
+        item.addView(hint, hlp2);
 
         item.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
@@ -1299,26 +1341,64 @@ public class HookEntry extends XposedModule {
             return;
         }
 
-        int idx = parent.indexOfChild(anchor);
-        if (idx < 0) idx = parent.getChildCount();
+        // 向上找到面板根容器（LPPRoundedLinearLayout），插它的第 0 位
+        // parent 只是当前卡片的内容器，直接插 0 会落在卡片内部
+        // 面板结构：根 → 多个卡片（每张卡片里才是菜单项）
+        // parent = 当前卡片；必须插到卡片的父级，才能出现在整个面板最上面
+        ViewGroup host = parent;
+        android.view.ViewParent vp0 = parent.getParent();
+        if (vp0 instanceof ViewGroup) {
+            ViewGroup pp = (ViewGroup) vp0;
+            StringBuilder sb = new StringBuilder("menu siblings of card: ");
+            for (int i = 0; i < pp.getChildCount() && i < 8; i++) {
+                View c = pp.getChildAt(i);
+                sb.append(c == null ? "null" : c.getClass().getSimpleName()).append(' ');
+            }
+            log(4, TAG, sb.toString() + " | cardChild=" + parent.getChildCount());
+            if (pp.getChildCount() >= 2) host = pp;
+        }
+        final int idx = 0;
+        log(4, TAG, "menu host=" + host.getClass().getSimpleName()
+                + " (from " + parent.getClass().getSimpleName() + ")");
 
-        // 必须拷贝 LayoutParams，不能复用 anchor 的实例
-        ViewGroup.LayoutParams src = anchor.getLayoutParams();
+        // 互斥：扫整个面板，已有「下载」类项就不重复插
+        for (int i = 0; i < host.getChildCount(); i++) {
+            View c = host.getChildAt(i);
+            if (c == null) continue;
+            if (mark.equals(c.getTag())) {
+                log(4, TAG, "menu: own item present, skip");
+                return;
+            }
+            String txt = collectText(c);
+            if (txt != null && txt.contains("下载") && txt.contains("画质")) {
+                log(5, TAG, "menu: another module already added a download item, skip");
+                sMenuInjectFails++;
+                return;
+            }
+        }
+
+        // 明确给宽高：拷 anchor 的 LayoutParams 会带 weight/height=0，导致新项被挤成 0 高
+        final int mh = (int) (52 * ctx.getResources().getDisplayMetrics().density);
         ViewGroup.LayoutParams dst;
-        if (src instanceof LinearLayout.LayoutParams) {
-            dst = new LinearLayout.LayoutParams((LinearLayout.LayoutParams) src);
-        } else if (src != null) {
-            dst = new ViewGroup.LayoutParams(src.width, src.height);
+        if (host instanceof LinearLayout) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = (int) (8 * ctx.getResources().getDisplayMetrics().density);
+            lp.bottomMargin = (int) (8 * ctx.getResources().getDisplayMetrics().density);
+            dst = lp;
         } else {
             dst = new ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT);
         }
+        item.setMinimumHeight(mh);
+        item.setBackgroundColor(0xFF2A2A2E);
         try {
-            parent.addView(item, idx, dst);
+            host.addView(item, idx, dst);
             sMenuInjectOk++;
             log(4, TAG, "native menu item inserted at " + idx + " of "
-                    + parent.getClass().getSimpleName() + " (children=" + parent.getChildCount() + ")");
+                    + host.getClass().getSimpleName() + " (children=" + host.getChildCount() + ")");
         } catch (Throwable t) {
             sMenuInjectFails++;
             log(5, TAG, "menu addView fail " + t);
@@ -1428,6 +1508,31 @@ public class HookEntry extends XposedModule {
         return null;
     }
 
+    /** 递归收集 View 树文本，用于互斥检测 */
+    private static String collectText(View v) {
+        if (v == null) return "";
+        StringBuilder sb = new StringBuilder();
+        java.util.ArrayDeque<View> q = new java.util.ArrayDeque<View>();
+        q.add(v);
+        int guard = 0;
+        while (!q.isEmpty() && guard++ < 80) {
+            View cur = q.poll();
+            if (cur == null) continue;
+            if (cur instanceof TextView) {
+                CharSequence cs = ((TextView) cur).getText();
+                if (cs != null && cs.length() > 0) sb.append(cs).append('|');
+            }
+            if (cur instanceof ViewGroup) {
+                ViewGroup g = (ViewGroup) cur;
+                for (int i = 0; i < g.getChildCount() && i < 40; i++) {
+                    View ch = g.getChildAt(i);
+                    if (ch != null) q.add(ch);
+                }
+            }
+        }
+        return sb.toString();
+    }
+
     private boolean prefOn(String key, boolean def) {
         try {
             android.content.SharedPreferences p = getRemotePreferences(PREF);
@@ -1438,6 +1543,79 @@ public class HookEntry extends XposedModule {
 
     private boolean isEmojiEnabled() { return prefOn("emoji", true); }
     private boolean isAutoPlayEnabled() { return prefOn("autoPlay", true); }
+
+    /* ============ 模块互斥检测 ============ */
+
+    /** 已知会与本模块抢同一 hook 点的抖音模块关键词 */
+    private static final String[] CONFLICT_HINTS = {
+            "dyhelper", "douyinhelper", "dyplus", "tiktok",
+            "aweme.helper", "douyin.helper", "dy.helper"
+    };
+
+    private static volatile boolean sConflictChecked = false;
+
+    /** 扫一遍已装的 Xposed 模块，发现同类就告警（不阻断，只提示） */
+    private void checkModuleConflicts() {
+        if (sConflictChecked) return;
+        sConflictChecked = true;
+        try {
+            android.content.Context app = null;
+            try {
+                Class<?> at = Class.forName("android.app.ActivityThread");
+                Object o = at.getMethod("currentApplication").invoke(null);
+                if (o instanceof android.content.Context) app = (android.content.Context) o;
+            } catch (Throwable ignored) {}
+            if (app == null) { log(4, TAG, "conflict: no ctx, skip"); return; }
+
+            android.content.pm.PackageManager pm = app.getPackageManager();
+            java.util.List<android.content.pm.ApplicationInfo> apps =
+                    pm.getInstalledApplications(0);
+            int found = 0;
+            for (android.content.pm.ApplicationInfo ai : apps) {
+                try {
+                    if (ai == null || ai.sourceDir == null) continue;
+                    if ("com.fj.dyhd".equals(ai.packageName)) continue;
+
+                    // 是不是 Xposed 模块
+                    boolean isModule = false;
+                    java.util.zip.ZipFile zf = null;
+                    try {
+                        zf = new java.util.zip.ZipFile(ai.sourceDir);
+                        isModule = zf.getEntry("META-INF/xposed/module.prop") != null
+                                || zf.getEntry("assets/xposed_init") != null;
+                        // 顺带读 scope，看是不是同一个目标
+                        if (isModule) {
+                            boolean sameScope = false;
+                            java.util.zip.ZipEntry se = zf.getEntry("META-INF/xposed/scope.list");
+                            if (se != null) {
+                                java.io.InputStream is = zf.getInputStream(se);
+                                byte[] buf = new byte[1024];
+                                int n = is.read(buf);
+                                is.close();
+                                if (n > 0) {
+                                    String sc = new String(buf, 0, n, "UTF-8");
+                                    sameScope = sc.contains("com.ss.android.ugc.aweme");
+                                }
+                            }
+                            if (sameScope) {
+                                String label = String.valueOf(pm.getApplicationLabel(ai));
+                                log(5, TAG, "conflict module: " + ai.packageName
+                                        + " (" + label + ") also targets aweme");
+                                found++;
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        if (zf != null) try { zf.close(); } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable ignored) {}
+            }
+            if (found == 0) log(4, TAG, "conflict: none");
+            else log(5, TAG, "conflict: " + found + " module(s) share the same scope");
+        } catch (Throwable t) {
+            log(5, TAG, "conflict check fail " + t);
+        }
+    }
 
     private boolean isEnabled() {
         try {
