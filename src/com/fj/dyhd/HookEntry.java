@@ -55,7 +55,6 @@ public class HookEntry extends XposedModule {
         // 长按面板注入已停用：改由全局悬浮球承担
         String b = "panel-off";
         String c = hookCommentMedia(cl);
-        hookPreviewButtons(cl);
         hookDialogEmoji(cl);
         hookActivityTracker(cl);
         hookAutoPlay(cl);
@@ -1404,8 +1403,7 @@ public class HookEntry extends XposedModule {
                 {"adBlock",  "屏蔽广告"},
                 {"liveSkip", "直播跳过"},
                 {"longSkip", "长视频跳过"},
-                {"autoPlay", "自动播放"},
-                {"emoji",    "表情下载"}
+                {"autoPlay", "自动播放"}
         };
         for (int oi = 0; oi < opts.length; oi++) {
             final String[] o = opts[oi];
@@ -1513,7 +1511,6 @@ public class HookEntry extends XposedModule {
     private static java.util.Map<String, Object> defaultConfig() {
         java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
         m.put("enabled", Boolean.TRUE);
-        m.put("emoji", Boolean.TRUE);
         m.put("autoPlay", Boolean.TRUE);
         m.put("adBlock", Boolean.TRUE);
         m.put("liveSkip", Boolean.TRUE);
