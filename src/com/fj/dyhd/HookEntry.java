@@ -915,7 +915,28 @@ public class HookEntry extends XposedModule {
     private void hookActivityTracker(ClassLoader cl) {
         // 接收器需要 Context，等 Activity 起来后再注册
         android.os.Handler h0 = new android.os.Handler(android.os.Looper.getMainLooper());
-        h0.postDelayed(new Runnable() { @Override public void run() { registerConfigReceiver(); } }, 1500);
+        h0.postDelayed(new Runnable() { @Override public void run() {
+            registerConfigReceiver();
+            ensureMirror();
+        } }, 1500);
+
+        // 广告标签定时扫描：界面上出现「广告」就划过
+        final android.os.Handler ah = new android.os.Handler(android.os.Looper.getMainLooper());
+        ah.post(new Runnable() {
+            @Override public void run() {
+                try {
+                    if (isAdBlockEnabled() && hasAdLabelOnScreen()) {
+                        long now2 = android.os.SystemClock.elapsedRealtime();
+                        if (now2 - sLastFeedSkipTs > 1500) {
+                            sLastFeedSkipTs = now2;
+                            log(4, TAG, "ad label scan hit -> swipe");
+                            swipeToNext();
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                ah.postDelayed(this, 1200);
+            }
+        });
         try {
             final Method onResume = android.app.Activity.class.getDeclaredMethod("onResume");
             hook(onResume).setId("dyhd-act-resume").intercept(new XposedInterface.Hooker() {
@@ -1074,6 +1095,426 @@ public class HookEntry extends XposedModule {
         } catch (Throwable t) { log(5, TAG, "ad label hook fail " + t); }
     }
 
+    /* ============ 6a2) 「更多功能」长按入口 ============ */
+
+    /** 在 View 树里找 text 匹配的 TextView */
+    private static TextView findText(View root, String text) {
+        if (root == null) return null;
+        java.util.ArrayDeque<View> q = new java.util.ArrayDeque<>();
+        q.add(root);
+        int guard = 0;
+        while (!q.isEmpty() && guard++ < 2000) {
+            View v = q.poll();
+            if (v == null) continue;
+            if (v instanceof TextView) {
+                CharSequence cs = ((TextView) v).getText();
+                if (cs != null && text.contentEquals(cs)) return (TextView) v;
+            }
+            if (v instanceof ViewGroup) {
+                ViewGroup g = (ViewGroup) v;
+                for (int i = 0; i < g.getChildCount() && i < 60; i++) {
+                    View c = g.getChildAt(i);
+                    if (c != null) q.add(c);
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 诊断：收集当前界面所有短文本 */
+    private String dumpShortTexts() {
+        try {
+            android.app.Activity a = sCurActivity;
+            if (a == null) return "no-activity";
+            View decor = a.getWindow().getDecorView();
+            if (decor == null) return "no-decor";
+            StringBuilder sb = new StringBuilder();
+            java.util.ArrayDeque<View> q = new java.util.ArrayDeque<>();
+            q.add(decor);
+            int guard = 0;
+            java.util.HashSet<String> seen = new java.util.HashSet<>();
+            while (!q.isEmpty() && guard++ < 3000) {
+                View v = q.poll();
+                if (v == null) continue;
+                if (v instanceof TextView) {
+                    CharSequence cs = ((TextView) v).getText();
+                    if (cs != null) {
+                        String t = cs.toString().trim();
+                        if (t.length() > 0 && t.length() <= 6 && seen.add(t)) {
+                            sb.append(t).append('|');
+                        }
+                    }
+                }
+                CharSequence cd = v.getContentDescription();
+                if (cd != null) {
+                    String t = cd.toString().trim();
+                    if (t.length() > 0 && t.length() <= 6 && seen.add("cd:" + t)) {
+                        sb.append("cd:").append(t).append('|');
+                    }
+                }
+                if (v instanceof ViewGroup) {
+                    ViewGroup g = (ViewGroup) v;
+                    for (int i = 0; i < g.getChildCount() && i < 80; i++) {
+                        View c = g.getChildAt(i);
+                        if (c != null) q.add(c);
+                    }
+                }
+            }
+            return sb.toString();
+        } catch (Throwable t) { return "err:" + t; }
+    }
+
+    /** 按 text 或 contentDescription 找 View（抖音很多标签只有 desc） */
+    private static View findViewByText(View root, String text) {
+        if (root == null) return null;
+        java.util.ArrayDeque<View> q = new java.util.ArrayDeque<>();
+        q.add(root);
+        int guard = 0;
+        while (!q.isEmpty() && guard++ < 4000) {
+            View v = q.poll();
+            if (v == null) continue;
+            if (v instanceof TextView) {
+                CharSequence cs = ((TextView) v).getText();
+                if (cs != null && text.contentEquals(cs)) return v;
+            }
+            CharSequence cd = v.getContentDescription();
+            if (cd != null && text.contentEquals(cd)) return v;
+            if (v instanceof ViewGroup) {
+                ViewGroup g = (ViewGroup) v;
+                for (int i = 0; i < g.getChildCount() && i < 80; i++) {
+                    View c = g.getChildAt(i);
+                    if (c != null) q.add(c);
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 给「更多功能」按钮挂长按，弹出功能面板 */
+    private void hookMoreButton(final android.app.Activity act) {
+        try {
+            if (act == null) return;
+            View decor = act.getWindow().getDecorView();
+            if (decor == null) return;
+            // 抖音不同版本叫「更多功能」或「全部功能」
+            TextView more = findText(decor, "更多功能");
+            if (more == null) more = findText(decor, "全部功能");
+            if (more == null) more = findText(decor, "更多");
+            if (more == null) return;
+            if (MARK_MORE.equals(more.getTag())) return;
+            more.setTag(MARK_MORE);
+            more.setOnLongClickListener(new View.OnLongClickListener() {
+                @Override public boolean onLongClick(View v) {
+                    try { showFeaturePanel(act); }
+                    catch (Throwable t) { log(5, TAG, "more panel err " + t); }
+                    return true;
+                }
+            });
+            log(4, TAG, "more button long-press hooked on " + act.getClass().getSimpleName());
+        } catch (Throwable t) { log(5, TAG, "hookMoreButton fail " + t); }
+    }
+
+    private static final String MARK_MORE = "fj_dyhd_more";
+
+    /** 长按「更多功能」弹出的功能面板 */
+    private void showFeaturePanel(final android.app.Activity act) {
+        final android.content.Context ctx = act;
+        final float d = ctx.getResources().getDisplayMetrics().density;
+
+        // 外层容器（圆角卡片）
+        LinearLayout root = new LinearLayout(ctx);
+        root.setOrientation(LinearLayout.VERTICAL);
+        android.graphics.drawable.GradientDrawable bg =
+                new android.graphics.drawable.GradientDrawable();
+        bg.setColor(0xFF1B1B1F);
+        bg.setCornerRadius(20 * d);
+        root.setBackground(bg);
+        root.setClipToOutline(true);
+
+        // ---- 标题栏 ----
+        LinearLayout header = new LinearLayout(ctx);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding((int) (20 * d), (int) (18 * d), (int) (14 * d), (int) (14 * d));
+
+        TextView title = new TextView(ctx);
+        title.setText("抖plus");
+        title.setTextSize(19f);
+        title.setTextColor(0xFFF2F4F8);
+        title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        title.setLayoutParams(new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        header.addView(title);
+
+        TextView close = new TextView(ctx);
+        close.setText("✕");
+        close.setTextSize(17f);
+        close.setTextColor(0xFF8A8A90);
+        close.setPadding((int) (10 * d), (int) (4 * d), (int) (6 * d), (int) (4 * d));
+        header.addView(close);
+        root.addView(header);
+
+        // 分隔线
+        View line1 = new View(ctx);
+        line1.setBackgroundColor(0xFF2E2E34);
+        root.addView(line1, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, (int) (0.8f * d)));
+
+        // ---- 高画质下载 ----
+        LinearLayout dlRow = new LinearLayout(ctx);
+        dlRow.setOrientation(LinearLayout.HORIZONTAL);
+        dlRow.setGravity(Gravity.CENTER_VERTICAL);
+        dlRow.setPadding((int) (20 * d), (int) (16 * d), (int) (20 * d), (int) (16 * d));
+
+        android.widget.ImageView dlIcon = new android.widget.ImageView(ctx);
+        try {
+            android.content.Context mctx = ctx.createPackageContext("com.fj.dyhd",
+                    android.content.Context.CONTEXT_IGNORE_SECURITY
+                            | android.content.Context.CONTEXT_INCLUDE_CODE);
+            android.content.res.Resources mres = mctx.getResources();
+            int rid = mres.getIdentifier("ic_dl", "drawable", "com.fj.dyhd");
+            if (rid != 0) dlIcon.setImageDrawable(mres.getDrawable(rid, null));
+        } catch (Throwable ignored) {}
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(
+                (int) (22 * d), (int) (22 * d));
+        ilp.rightMargin = (int) (12 * d);
+        dlRow.addView(dlIcon, ilp);
+
+        TextView dlText = new TextView(ctx);
+        dlText.setText("高画质下载");
+        dlText.setTextSize(15.5f);
+        dlText.setTextColor(0xFF25F4EE);
+        dlText.setLayoutParams(new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        dlRow.addView(dlText);
+
+        TextView dlHint = new TextView(ctx);
+        dlHint.setText("无水印 ›");
+        dlHint.setTextSize(12.5f);
+        dlHint.setTextColor(0xFF6A6A70);
+        dlRow.addView(dlHint);
+
+        dlRow.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                try { onFabClick(ctx); } catch (Throwable ignored) {}
+            }
+        });
+        root.addView(dlRow);
+
+        // 分隔线
+        View line2 = new View(ctx);
+        line2.setBackgroundColor(0xFF2E2E34);
+        LinearLayout.LayoutParams l2p = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, (int) (0.8f * d));
+        l2p.leftMargin = (int) (20 * d);
+        l2p.rightMargin = (int) (20 * d);
+        root.addView(line2, l2p);
+
+        // ---- 开关列表 ----
+        final String[][] opts = {
+                {"adBlock",  "屏蔽广告"},
+                {"adAggressive", "激进去广告"},
+                {"liveSkip", "直播跳过"},
+                {"longSkip", "长视频跳过"},
+                {"autoPlay", "自动播放"},
+                {"emoji",    "表情下载"}
+        };
+        for (int oi = 0; oi < opts.length; oi++) {
+            final String[] o = opts[oi];
+            LinearLayout row = new LinearLayout(ctx);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding((int) (20 * d), (int) (13 * d), (int) (20 * d), (int) (13 * d));
+
+            TextView label = new TextView(ctx);
+            label.setText(o[1]);
+            label.setTextSize(15f);
+            label.setTextColor(0xFFF2F4F8);
+            label.setLayoutParams(new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            row.addView(label);
+
+            // 长视频：阀值可点
+            if ("longSkip".equals(o[0])) {
+                final TextView thr = new TextView(ctx);
+                thr.setText(longSkipSeconds() + "s");
+                thr.setTextSize(12.5f);
+                thr.setTextColor(0xFF25F4EE);
+                thr.setPadding(0, 0, (int) (10 * d), 0);
+                thr.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) { editThresholdInPanel(ctx, thr); }
+                });
+                row.addView(thr);
+            }
+
+            final android.widget.Switch sw = new android.widget.Switch(ctx);
+            sw.setChecked(prefOn(o[0], true));
+            sw.setScaleX(0.8f);
+            sw.setScaleY(0.8f);
+            sw.setOnCheckedChangeListener(
+                    new android.widget.CompoundButton.OnCheckedChangeListener() {
+                        @Override public void onCheckedChanged(
+                                android.widget.CompoundButton b, boolean v) {
+                            saveOne(o[0], v ? Boolean.TRUE : Boolean.FALSE);
+                            syncToModuleApp(o[0], v);
+                        }
+                    });
+            row.addView(sw);
+
+            root.addView(row);
+
+            if (oi < opts.length - 1) {
+                View sl = new View(ctx);
+                sl.setBackgroundColor(0xFF26262B);
+                LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, (int) (0.6f * d));
+                slp.leftMargin = (int) (20 * d);
+                slp.rightMargin = (int) (20 * d);
+                root.addView(sl, slp);
+            }
+        }
+
+        // ---- 底部关闭 ----
+        View line3 = new View(ctx);
+        line3.setBackgroundColor(0xFF2E2E34);
+        LinearLayout.LayoutParams l3p = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, (int) (0.8f * d));
+        l3p.topMargin = (int) (4 * d);
+        root.addView(line3, l3p);
+
+        TextView btn = new TextView(ctx);
+        btn.setText("关闭");
+        btn.setTextSize(15f);
+        btn.setTextColor(0xFF8A8A90);
+        btn.setGravity(Gravity.CENTER);
+        btn.setPadding(0, (int) (16 * d), 0, (int) (16 * d));
+        root.addView(btn);
+
+        final android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(ctx)
+                .setView(root)
+                .create();
+        dlg.show();
+
+        // 去掉默认白底，让圆角生效
+        try {
+            android.view.Window w = dlg.getWindow();
+            if (w != null) {
+                w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0x00000000));
+                w.setLayout((int) (300 * d), ViewGroup.LayoutParams.WRAP_CONTENT);
+            }
+        } catch (Throwable ignored) {}
+
+        close.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { dlg.dismiss(); }
+        });
+        btn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { dlg.dismiss(); }
+        });
+    }
+
+    private TextView makePanelRow(android.content.Context ctx, String text, int color, float d) {
+        TextView tv = new TextView(ctx);
+        tv.setText(text);
+        tv.setTextSize(15f);
+        tv.setTextColor(color);
+        tv.setPadding(0, (int) (10 * d), 0, (int) (10 * d));
+        return tv;
+    }
+
+    /** 所有配置项及其默认值（必须跟 prefOn 的 def 一致） */
+    private static java.util.Map<String, Object> defaultConfig() {
+        java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+        m.put("enabled", Boolean.TRUE);
+        m.put("emoji", Boolean.TRUE);
+        m.put("autoPlay", Boolean.TRUE);
+        m.put("adBlock", Boolean.TRUE);
+        m.put("adAggressive", Boolean.FALSE);
+        m.put("liveSkip", Boolean.TRUE);
+        m.put("longSkip", Boolean.TRUE);
+        m.put("longSkipSec", 60L);
+        return m;
+    }
+
+    /** 保存单项到镜像（缺失的 key 用默认值补齐） */
+    private void saveOne(String key, Object val) {
+        java.util.Map<String, Object> m = readMirror();
+        if (m.isEmpty()) {
+            m = defaultConfig();
+            log(4, TAG, "mirror init with defaults");
+        } else {
+            // 补齐旧版本遗留的缺失 key
+            java.util.Map<String, Object> def = defaultConfig();
+            for (java.util.Map.Entry<String, Object> e : def.entrySet()) {
+                if (!m.containsKey(e.getKey())) m.put(e.getKey(), e.getValue());
+            }
+        }
+        m.put(key, val);
+        writeMirror(m);
+        sPrefCache = m;
+        sPrefCacheTs = android.os.SystemClock.elapsedRealtime();
+        sPrefBackoffTs = 0L;
+        log(4, TAG, "panel save " + key + "=" + val + " full=" + m);
+    }
+
+    /** 启动时保证镜像存在（否则全部走默认值） */
+    private void ensureMirror() {
+        try {
+            java.util.Map<String, Object> m = readMirror();
+            if (m.isEmpty()) {
+                writeMirror(defaultConfig());
+                log(4, TAG, "mirror bootstrapped");
+            } else {
+                java.util.Map<String, Object> def = defaultConfig();
+                boolean need = false;
+                for (String k : def.keySet()) if (!m.containsKey(k)) { need = true; break; }
+                if (need) {
+                    for (java.util.Map.Entry<String, Object> e : def.entrySet()) {
+                        if (!m.containsKey(e.getKey())) m.put(e.getKey(), e.getValue());
+                    }
+                    writeMirror(m);
+                    log(4, TAG, "mirror filled missing keys");
+                }
+            }
+        } catch (Throwable t) { log(5, TAG, "ensureMirror fail " + t); }
+    }
+
+    /** 把改动回写给模块 App，保证两边一致 */
+    private void syncToModuleApp(String key, Object val) {
+        try {
+            android.content.Context c = appCtx();
+            if (c == null) return;
+            android.content.Intent it = new android.content.Intent("com.fj.dyhd.SYNC");
+            it.setPackage("com.fj.dyhd");
+            it.putExtra("key", key);
+            it.putExtra("val", String.valueOf(val));
+            c.sendBroadcast(it);
+        } catch (Throwable ignored) {}
+    }
+
+    /** 面板内改阀值 */
+    private void editThresholdInPanel(final android.content.Context ctx, final TextView show) {
+        final android.widget.EditText et = new android.widget.EditText(ctx);
+        et.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        et.setText(String.valueOf(longSkipSeconds()));
+        et.setHint("单位秒，60 = 1 分钟");
+        new android.app.AlertDialog.Builder(ctx)
+                .setTitle("长视频阀值（秒）")
+                .setView(et)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener() {
+                    @Override public void onClick(android.content.DialogInterface dlg, int w) {
+                        long m = 60;
+                        try { m = Long.parseLong(et.getText().toString().trim()); } catch (Throwable ignored) {}
+                        if (m <= 0) m = 60;
+                        if (m > 36000) m = 36000;
+                        saveOne("longSkipSec", m);
+                        syncToModuleApp("longSkipSec", m);
+                        show.setText("  " + m + "s");
+                    }
+                })
+                .show();
+    }
+
     /* ============ 6b) 首页悬浮球 ============ */
 
     private static final String MARK_FAB = "fj_dyhd_fab";
@@ -1191,6 +1632,13 @@ public class HookEntry extends XposedModule {
 
             sFab = fab;
             sFabHost = root;
+            // 「我」页的按钮是后动态创建的，需要延迟重试
+            final android.os.Handler mh = new android.os.Handler(android.os.Looper.getMainLooper());
+            for (int mi = 0; mi < 6; mi++) {
+                mh.postDelayed(new Runnable() {
+                    @Override public void run() { hookMoreButton(act); }
+                }, 800L + mi * 1200L);
+            }
             log(4, TAG, "fab shown on " + cn);
         } catch (Throwable t) { log(5, TAG, "fab err " + t); }
     }
@@ -1676,17 +2124,69 @@ public class HookEntry extends XposedModule {
     private static final java.util.Map<String, Object> EMPTY_PREFS =
             java.util.Collections.unmodifiableMap(new java.util.HashMap<String, Object>());
 
+    /* ============ 镜像：配置存到抖音自己的 prefs ============ */
+
+    private static final String MIRROR_PREF = "dyhd_mirror";
+
+    private android.content.SharedPreferences mirror() {
+        android.content.Context c = appCtx();
+        if (c == null) return null;
+        try {
+            return c.getSharedPreferences(MIRROR_PREF, android.content.Context.MODE_PRIVATE);
+        } catch (Throwable t) { return null; }
+    }
+
+    private java.util.Map<String, Object> readMirror() {
+        java.util.Map<String, Object> m = new java.util.HashMap<>();
+        android.content.SharedPreferences p = mirror();
+        if (p == null) return m;
+        try {
+            for (java.util.Map.Entry<String, ?> e : p.getAll().entrySet()) {
+                if (e.getValue() != null) m.put(e.getKey(), e.getValue());
+            }
+        } catch (Throwable ignored) {}
+        return m;
+    }
+
+    private void writeMirror(java.util.Map<String, Object> m) {
+        android.content.SharedPreferences p = mirror();
+        if (p == null || m.isEmpty()) return;
+        try {
+            android.content.SharedPreferences.Editor e = p.edit();
+            for (java.util.Map.Entry<String, Object> en : m.entrySet()) {
+                Object v = en.getValue();
+                if (v instanceof Boolean) e.putBoolean(en.getKey(), (Boolean) v);
+                else if (v instanceof Long) e.putLong(en.getKey(), (Long) v);
+                else if (v instanceof Number) e.putLong(en.getKey(), ((Number) v).longValue());
+                else e.putString(en.getKey(), String.valueOf(v));
+            }
+            e.commit();
+            log(4, TAG, "mirror written: " + m);
+        } catch (Throwable ignored) {}
+    }
+
     private java.util.Map<String, Object> prefs() {
         long now = android.os.SystemClock.elapsedRealtime();
 
-        // 退避中：直接用上一次的缓存（或空），不再打扰 provider
+        // １）内存缓存
+        java.util.Map<String, Object> c = sPrefCache;
+        if (c != null && !c.isEmpty() && now - sPrefCacheTs < 3000) return c;
+
+        // ２）镜像（广播写入抖音自己的 prefs，最可靠）
+        java.util.Map<String, Object> mir = readMirror();
+        if (!mir.isEmpty()) {
+            sPrefCache = mir;
+            sPrefCacheTs = now;
+            sPrefFailCount = 0;
+            return mir;
+        }
+
+        // ３）退避中：不再打扰 provider
         if (now < sPrefBackoffTs) {
             return sPrefCache != null ? sPrefCache : EMPTY_PREFS;
         }
 
-        java.util.Map<String, Object> c = sPrefCache;
-        if (c != null && !c.isEmpty() && now - sPrefCacheTs < 3000) return c;
-
+        // ４）provider / 文件 / remote API
         java.util.Map<String, Object> m = readRemotePrefs();
 
         // 只缓存非空结果：抖音冷启动初期 provider 可能还未就绪，
@@ -1695,6 +2195,7 @@ public class HookEntry extends XposedModule {
             sPrefCache = m;
             sPrefCacheTs = now;
             sPrefFailCount = 0;
+            writeMirror(m);
             return m;
         }
 
@@ -1809,6 +2310,7 @@ public class HookEntry extends XposedModule {
 
     /** 对当前视频做广告/直播/长视频检测，命中就自动上滑 */
     private static volatile long sLastProbeTs = 0L;
+    private static volatile long sLastDumpTs = 0L;
 
     private void checkAndSkipFeed(Object aweme) {
         if (aweme == null) return;
@@ -1821,6 +2323,9 @@ public class HookEntry extends XposedModule {
         try {
             if (live && boolCall(aweme, "isLive")) why = "live";
         } catch (Throwable ignored) {}
+        // 最直接：界面上写着「广告」就是广告
+        if (why == null && ad && hasAdLabelOnScreen()) why = "ad(label)";
+
         if (why == null && ad) {
             try {
                 // 实测命中的抖音广告标记（电商商品卡）：
@@ -1829,6 +2334,8 @@ public class HookEntry extends XposedModule {
                 else if (boolCall(aweme, "getIsAdAweme")) why = "ad(getIsAdAweme)";
                 else if (longCall(aweme, "getAdAwemeSource") > 0) {
                     why = "ad(source=" + longCall(aweme, "getAdAwemeSource") + ")";
+                } else if (prefOn("adAggressive", false) && hasCommerce(aweme)) {
+                    why = "ad(commerce)";
                 } else if (boolCall(aweme, "isAd")) why = "ad(isAd)";
                 else if (boolCall(aweme, "isCommerce")) why = "ad(isCommerce)";
                 else if (boolCall(aweme, "isAdTraffic")) why = "ad(isAdTraffic)";
@@ -1996,6 +2503,59 @@ public class HookEntry extends XposedModule {
                 log(4, TAG, "feed probe live=" + lv + " ad=" + adf
                         + " dur=" + dur + "ms limitSec=" + longSkipSeconds()
                         + " v=" + vinfo + " prefKeys=" + prefCnt);
+                // ---- 广告标记全量探针 ----
+                long tDump = android.os.SystemClock.elapsedRealtime();
+                if (tDump - sLastDumpTs > 5000) {
+                    sLastDumpTs = tDump;
+                    StringBuilder tf = new StringBuilder();
+                    try {
+                        for (Method bm2 : aweme.getClass().getDeclaredMethods()) {
+                            if (bm2.getParameterCount() != 0) continue;
+                            if (bm2.getReturnType() != boolean.class) continue;
+                            String n2 = bm2.getName();
+                            if (!(n2.toLowerCase().contains("ad")
+                                    || n2.toLowerCase().contains("commerce")
+                                    || n2.toLowerCase().contains("anchor")
+                                    || n2.toLowerCase().contains("market"))) continue;
+                            try {
+                                Object r2 = bm2.invoke(aweme);
+                                if (Boolean.TRUE.equals(r2)) tf.append(n2).append(',');
+                            } catch (Throwable ignored) {}
+                        }
+                    } catch (Throwable ignored) {}
+                    StringBuilder tn = new StringBuilder();
+                    try {
+                        String[] g2 = {"getAdAwemeSource", "getAdLinkType", "getAdOrderId",
+                                "getAdSchedule", "getAnchorType", "getCommerceType"};
+                        for (String gn2 : g2) {
+                            try {
+                                Method gm2 = aweme.getClass().getMethod(gn2);
+                                Object rv2 = gm2.invoke(aweme);
+                                if (rv2 != null) {
+                                    String sv3 = String.valueOf(rv2);
+                                    if (!"0".equals(sv3) && !"null".equals(sv3) && !"".equals(sv3)) {
+                                        tn.append(gn2).append('=').append(sv3).append(',');
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    } catch (Throwable ignored) {}
+                    StringBuilder to2 = new StringBuilder();
+                    try {
+                        for (Field f3 : aweme.getClass().getDeclaredFields()) {
+                            Class<?> ft3 = f3.getType();
+                            if (ft3.isPrimitive() || ft3 == String.class) continue;
+                            String fn3 = f3.getName().toLowerCase();
+                            if (!(fn3.contains("ad") || fn3.contains("commerce")
+                                    || fn3.contains("anchor") || fn3.contains("market")
+                                    || fn3.contains("promo") || fn3.contains("shop"))) continue;
+                            try {
+                                f3.setAccessible(true);
+                                if (f3.get(aweme) != null) to2.append(f3.getName()).append(',');
+                            } catch (Throwable ignored) {}
+                        }
+                    } catch (Throwable ignored) {}
+                }
             }
             return;
         }
@@ -2023,6 +2583,50 @@ public class HookEntry extends XposedModule {
             Object r = m.invoke(o);
             return r instanceof Boolean && (Boolean) r;
         } catch (Throwable ignored) { return false; }
+    }
+
+    /** 直接扫当前界面，看有没有「广告」两个字 */
+    private static volatile long sLastLabelTs = 0L;
+
+    private boolean hasAdLabelOnScreen() {
+        try {
+            android.app.Activity a = sCurActivity;
+            if (a == null) return false;
+            android.view.View decor = a.getWindow().getDecorView();
+            if (decor == null) return false;
+            return findViewByText(decor, "广告") != null
+                    || findViewByText(decor, "广告·推广") != null;
+        } catch (Throwable ignored) { return false; }
+    }
+
+    /** 宽松判定：商业内容字段非空（激进模式下用） */
+    private static boolean hasCommerce(Object aweme) {
+        if (aweme == null) return false;
+        try {
+            Class<?> c = aweme.getClass();
+            while (c != null && c != Object.class) {
+                for (Field f : c.getDeclaredFields()) {
+                    String fn = f.getName();
+                    if (!"mCommerceVideoAuthInfo".equals(fn)
+                            && !"mSimplePromotions".equals(fn)
+                            && !"awemeMarketInfo".equals(fn)) continue;
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(aweme);
+                        if (v == null) continue;
+                        if (v instanceof java.util.Collection) {
+                            if (!((java.util.Collection<?>) v).isEmpty()) return true;
+                        } else if (v instanceof java.util.Map) {
+                            if (!((java.util.Map<?, ?>) v).isEmpty()) return true;
+                        } else {
+                            return true;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+                c = c.getSuperclass();
+            }
+        } catch (Throwable ignored) {}
+        return false;
     }
 
     /** 取视频时长（ms）：getDuration 失效时扫混淆字段 */
@@ -2094,6 +2698,7 @@ public class HookEntry extends XposedModule {
                             sPrefCacheTs = android.os.SystemClock.elapsedRealtime();
                             sPrefBackoffTs = 0L;
                             sPrefFailCount = 0;
+                            writeMirror(m);
                             log(4, TAG, "config received: " + m);
                         }
                     } catch (Throwable t) { log(5, TAG, "config parse fail " + t); }
