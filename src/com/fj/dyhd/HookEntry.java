@@ -953,6 +953,8 @@ public class HookEntry extends XposedModule {
     private static volatile Object sLastAweme;      // 配套的 Aweme（用于标题）
     private static volatile long sLastSwipeTs = 0;   // 上次切走的时刻（节流）
     private static volatile long sLastUserTouchTs = 0; // 用户上次手动触摸的时刻
+    private static volatile boolean sInjectingTouch = false; // 模块自己注入手势期间
+    private static volatile long sLastSwipeExecTs = 0;       // swipeToNext 统一节流
     private static volatile View sFab;              // 悬浮球
     private static volatile ViewGroup sFabHost;     // 悬浮球宿主
 
@@ -1015,6 +1017,8 @@ public class HookEntry extends XposedModule {
             hook(dt).setId("dyhd-touch").intercept(new XposedInterface.Hooker() {
                 @Override public Object intercept(XposedInterface.Chain chain) {
                     try {
+                        // 模块自己注入的手势不算用户触摸
+                        if (sInjectingTouch) return chain.proceed();
                         Object self = chain.getThisObject();
                         if (self instanceof android.view.ViewGroup) {
                             android.view.MotionEvent e =
@@ -1081,6 +1085,16 @@ public class HookEntry extends XposedModule {
 
     /** 在主线程模拟一次上滑 */
     private void swipeToNext() {
+        // 四个调用点（广告标签扫描 / playCompleted / TextView标签 / feed skip）
+        // 各自的节流互不认识，可能同一瞬间一起触发 → 连滑多次。
+        // 在这里做一道统一闸门。
+        long tExec = android.os.SystemClock.elapsedRealtime();
+        if (sLastSwipeExecTs > 0 && tExec - sLastSwipeExecTs < 2500) {
+            log(4, TAG, "swipeToNext throttled (" + (tExec - sLastSwipeExecTs) + "ms)");
+            return;
+        }
+        sLastSwipeExecTs = tExec;
+
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
             @Override public void run() {
                 try {
@@ -1102,11 +1116,16 @@ public class HookEntry extends XposedModule {
                     android.view.MotionEvent mv3 = android.view.MotionEvent.obtain(t0, t0 + 180, android.view.MotionEvent.ACTION_MOVE, x, yEnd, 0);
                     android.view.MotionEvent u = android.view.MotionEvent.obtain(t0, t0 + 200, android.view.MotionEvent.ACTION_UP, x, yEnd, 0);
 
-                    root.dispatchTouchEvent(d);
-                    root.dispatchTouchEvent(mv1);
-                    root.dispatchTouchEvent(mv2);
-                    root.dispatchTouchEvent(mv3);
-                    root.dispatchTouchEvent(u);
+                    sInjectingTouch = true;
+                    try {
+                        root.dispatchTouchEvent(d);
+                        root.dispatchTouchEvent(mv1);
+                        root.dispatchTouchEvent(mv2);
+                        root.dispatchTouchEvent(mv3);
+                        root.dispatchTouchEvent(u);
+                    } finally {
+                        sInjectingTouch = false;
+                    }
                     d.recycle(); mv1.recycle(); mv2.recycle(); mv3.recycle(); u.recycle();
                     log(4, TAG, "autoplay: swiped up on " + a.getClass().getSimpleName());
                 } catch (Throwable t) { log(5, TAG, "swipe err " + t); }
