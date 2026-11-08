@@ -921,22 +921,27 @@ public class HookEntry extends XposedModule {
         } }, 1500);
 
         // 广告标签定时扫描：界面上出现「广告」就划过
-        final android.os.Handler ah = new android.os.Handler(android.os.Looper.getMainLooper());
-        ah.post(new Runnable() {
-            @Override public void run() {
-                try {
-                    if (isAdBlockEnabled() && hasAdLabelOnScreen()) {
-                        long now2 = android.os.SystemClock.elapsedRealtime();
-                        if (now2 - sLastFeedSkipTs > 1500) {
-                            sLastFeedSkipTs = now2;
-                            log(4, TAG, "ad label scan hit -> swipe");
-                            swipeToNext();
+        // 去重：hookActivityTracker 每个 Activity 都调一次，
+        // 不加标记会越切越多循环，全部在遍历 View 树
+        if (!sLabelLoopStarted) {
+            sLabelLoopStarted = true;
+            final android.os.Handler ah = new android.os.Handler(android.os.Looper.getMainLooper());
+            ah.post(new Runnable() {
+                @Override public void run() {
+                    try {
+                        if (isAdBlockEnabled() && hasAdLabelOnScreen()) {
+                            long now2 = android.os.SystemClock.elapsedRealtime();
+                            if (now2 - sLastFeedSkipTs > 1500) {
+                                sLastFeedSkipTs = now2;
+                                log(4, TAG, "ad label scan hit -> swipe");
+                                swipeToNext();
+                            }
                         }
-                    }
-                } catch (Throwable ignored) {}
-                ah.postDelayed(this, 1200);
-            }
-        });
+                    } catch (Throwable ignored) {}
+                    ah.postDelayed(this, 2500);
+                }
+            });
+        }
         try {
             final Method onResume = android.app.Activity.class.getDeclaredMethod("onResume");
             hook(onResume).setId("dyhd-act-resume").intercept(new XposedInterface.Hooker() {
@@ -1200,7 +1205,9 @@ public class HookEntry extends XposedModule {
             TextView more = findText(decor, "更多功能");
             if (more == null) more = findText(decor, "全部功能");
             if (more == null) more = findText(decor, "更多");
-            if (more == null) return;
+            if (more == null) {
+                return;
+            }
             if (MARK_MORE.equals(more.getTag())) return;
             more.setTag(MARK_MORE);
             more.setOnLongClickListener(new View.OnLongClickListener() {
@@ -1313,7 +1320,6 @@ public class HookEntry extends XposedModule {
         // ---- 开关列表 ----
         final String[][] opts = {
                 {"adBlock",  "屏蔽广告"},
-                {"adAggressive", "激进去广告"},
                 {"liveSkip", "直播跳过"},
                 {"longSkip", "长视频跳过"},
                 {"autoPlay", "自动播放"},
@@ -1428,7 +1434,6 @@ public class HookEntry extends XposedModule {
         m.put("emoji", Boolean.TRUE);
         m.put("autoPlay", Boolean.TRUE);
         m.put("adBlock", Boolean.TRUE);
-        m.put("adAggressive", Boolean.FALSE);
         m.put("liveSkip", Boolean.TRUE);
         m.put("longSkip", Boolean.TRUE);
         m.put("longSkipSec", 60L);
@@ -1534,7 +1539,11 @@ public class HookEntry extends XposedModule {
             if (!(decor instanceof ViewGroup)) return;
             final ViewGroup root = (ViewGroup) decor;
 
-            if (sFab != null && sFabHost == root && sFab.getParent() != null) return;
+            if (sFab != null && sFabHost == root && sFab.getParent() != null) {
+                // 悬浮球已在，但「更多功能」的 hook 仍需保证装上
+                hookMoreButton(act);
+                return;
+            }
             hideFab();
 
             final Context ctx = act;
@@ -1632,13 +1641,14 @@ public class HookEntry extends XposedModule {
 
             sFab = fab;
             sFabHost = root;
-            // 「我」页的按钮是后动态创建的，需要延迟重试
+            // 侧边栏是后动态创建的，持续轮询（已挂的会被 MARK_MORE 跳过）
             final android.os.Handler mh = new android.os.Handler(android.os.Looper.getMainLooper());
-            for (int mi = 0; mi < 6; mi++) {
-                mh.postDelayed(new Runnable() {
-                    @Override public void run() { hookMoreButton(act); }
-                }, 800L + mi * 1200L);
-            }
+            mh.post(new Runnable() {
+                @Override public void run() {
+                    try { hookMoreButton(act); } catch (Throwable ignored) {}
+                    mh.postDelayed(this, 3000L);
+                }
+            });
             log(4, TAG, "fab shown on " + cn);
         } catch (Throwable t) { log(5, TAG, "fab err " + t); }
     }
@@ -2334,8 +2344,6 @@ public class HookEntry extends XposedModule {
                 else if (boolCall(aweme, "getIsAdAweme")) why = "ad(getIsAdAweme)";
                 else if (longCall(aweme, "getAdAwemeSource") > 0) {
                     why = "ad(source=" + longCall(aweme, "getAdAwemeSource") + ")";
-                } else if (prefOn("adAggressive", false) && hasCommerce(aweme)) {
-                    why = "ad(commerce)";
                 } else if (boolCall(aweme, "isAd")) why = "ad(isAd)";
                 else if (boolCall(aweme, "isCommerce")) why = "ad(isCommerce)";
                 else if (boolCall(aweme, "isAdTraffic")) why = "ad(isAdTraffic)";
@@ -2362,7 +2370,7 @@ public class HookEntry extends XposedModule {
                 long dur = 0; boolean lv = false, adf = false;
                 String vinfo = "null";
                 try { lv = boolCall(aweme, "isLive"); } catch (Throwable ignored) {}
-                try { adf = boolCall(aweme, "isAd"); } catch (Throwable ignored) {}
+                try { adf = boolCall(aweme, "getAd"); } catch (Throwable ignored) {}
                 try {
                     Object v = getVideo(aweme);
                     if (v != null) {
@@ -2587,6 +2595,7 @@ public class HookEntry extends XposedModule {
 
     /** 直接扫当前界面，看有没有「广告」两个字 */
     private static volatile long sLastLabelTs = 0L;
+    private static volatile boolean sLabelLoopStarted = false;
 
     private boolean hasAdLabelOnScreen() {
         try {
@@ -2599,58 +2608,47 @@ public class HookEntry extends XposedModule {
         } catch (Throwable ignored) { return false; }
     }
 
-    /** 宽松判定：商业内容字段非空（激进模式下用） */
-    private static boolean hasCommerce(Object aweme) {
-        if (aweme == null) return false;
-        try {
-            Class<?> c = aweme.getClass();
-            while (c != null && c != Object.class) {
-                for (Field f : c.getDeclaredFields()) {
-                    String fn = f.getName();
-                    if (!"mCommerceVideoAuthInfo".equals(fn)
-                            && !"mSimplePromotions".equals(fn)
-                            && !"awemeMarketInfo".equals(fn)) continue;
-                    try {
-                        f.setAccessible(true);
-                        Object v = f.get(aweme);
-                        if (v == null) continue;
-                        if (v instanceof java.util.Collection) {
-                            if (!((java.util.Collection<?>) v).isEmpty()) return true;
-                        } else if (v instanceof java.util.Map) {
-                            if (!((java.util.Map<?, ?>) v).isEmpty()) return true;
-                        } else {
-                            return true;
-                        }
-                    } catch (Throwable ignored) {}
-                }
-                c = c.getSuperclass();
-            }
-        } catch (Throwable ignored) {}
-        return false;
-    }
-
     /** 取视频时长（ms）：getDuration 失效时扫混淆字段 */
     private static long videoDuration(Object video) {
         if (video == null) return 0L;
         long d = longCall(video, "getDuration");
         if (d > 0) return d;
-        long best = 0;
+
+        // getDuration 失效时扫混淆字段。
+        // 坑：宽高 1920/1080/2880 也落在 1000~1800000 区间，
+        // 取最大值会把宽度当成时长。必须先把宽高、时间戳排除。
+        java.util.Map<String, Long> nums = new java.util.LinkedHashMap<>();
         try {
             Class<?> c = video.getClass();
             while (c != null && c != Object.class) {
                 for (Field f : c.getDeclaredFields()) {
-                    if (f.getType() == long.class || f.getType() == int.class) {
-                        try {
-                            f.setAccessible(true);
-                            long v = f.getLong(video);
-                            // 时长特征：1s ~ 30min
-                            if (v >= 1000 && v <= 1800000 && v > best) best = v;
-                        } catch (Throwable ignored) {}
-                    }
+                    if (f.getType() != long.class && f.getType() != int.class) continue;
+                    try {
+                        f.setAccessible(true);
+                        nums.put(f.getName(), f.getLong(video));
+                    } catch (Throwable ignored) {}
                 }
                 c = c.getSuperclass();
             }
         } catch (Throwable ignored) {}
+
+        // 已知宽高字段名（抖音当前版本：s=宽 t=高 Q=时间戳）
+        java.util.Set<Long> exclude = new java.util.HashSet<>();
+        for (String k : new String[]{"s", "t", "Q", "width", "height"}) {
+            Long v = nums.get(k);
+            if (v != null && v > 0) exclude.add(v);
+        }
+
+        long best = 0;
+        for (java.util.Map.Entry<String, Long> e : nums.entrySet()) {
+            String k = e.getKey();
+            if ("s".equals(k) || "t".equals(k) || "Q".equals(k)
+                    || "width".equals(k) || "height".equals(k)) continue;
+            long v = e.getValue();
+            if (v < 1000 || v > 1800000) continue;
+            if (exclude.contains(v)) continue;          // 这个值已经是宽或高
+            if (v > best) best = v;
+        }
         return best;
     }
 
