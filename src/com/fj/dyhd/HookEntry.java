@@ -59,6 +59,7 @@ public class HookEntry extends XposedModule {
         hookDialogEmoji(cl);
         hookActivityTracker(cl);
         hookAutoPlay(cl);
+        hookUserTouch(cl);
         hookAdLabel(cl);
         // 原生菜单项已停用（悬浮球已足够）
         hookAwemeDesc(cl);
@@ -908,6 +909,7 @@ public class HookEntry extends XposedModule {
     private static volatile Object sLastVideo;      // 最近一次被取下载地址的 Video
     private static volatile Object sLastAweme;      // 配套的 Aweme（用于标题）
     private static volatile long sLastSwipeTs = 0;   // 上次切走的时刻（节流）
+    private static volatile long sLastUserTouchTs = 0; // 用户上次手动触摸的时刻
     private static volatile View sFab;              // 悬浮球
     private static volatile ViewGroup sFabHost;     // 悬浮球宿主
 
@@ -962,6 +964,32 @@ public class HookEntry extends XposedModule {
     }
 
     /** 播放完成回调：开关打开时上滑到下一个视频 */
+    /** 记录用户手动触摸，用来区分“自然播完”和“用户划走” */
+    private void hookUserTouch(ClassLoader cl) {
+        try {
+            Method dt = android.view.View.class.getDeclaredMethod(
+                    "dispatchTouchEvent", android.view.MotionEvent.class);
+            hook(dt).setId("dyhd-touch").intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) {
+                    try {
+                        Object self = chain.getThisObject();
+                        if (self instanceof android.view.ViewGroup) {
+                            android.view.MotionEvent e =
+                                    (android.view.MotionEvent) chain.getArg(0);
+                            int act = e.getActionMasked();
+                            if (act == android.view.MotionEvent.ACTION_UP
+                                    || act == android.view.MotionEvent.ACTION_CANCEL) {
+                                sLastUserTouchTs = android.os.SystemClock.elapsedRealtime();
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                    return chain.proceed();
+                }
+            });
+            log(4, TAG, "user touch hook installed");
+        } catch (Throwable t) { log(5, TAG, "user touch hook fail " + t); }
+    }
+
     private void hookAutoPlay(ClassLoader cl) {
         try {
             Class<?> c = Class.forName(
@@ -980,6 +1008,16 @@ public class HookEntry extends XposedModule {
                             boolean finished = arg instanceof Boolean ? ((Boolean) arg).booleanValue() : true;
                             if (!finished) return ret;
                             long now = android.os.SystemClock.elapsedRealtime();
+
+                            // 关键：用户手动划过也会触发 onChanged(finished) →
+                            // 模块当成“播完”再划一次 → 多切一个。
+                            // 手刚动过就不算自然播完。
+                            long sinceTouch = now - sLastUserTouchTs;
+                            if (sinceTouch < 4000 && sLastUserTouchTs > 0) {
+                                log(4, TAG, "playCompleted skipped (user touched " + sinceTouch + "ms ago)");
+                                return ret;
+                            }
+
                             long gap = now - sLastSwipeTs;
                             if (gap < 2500) {           // 2.5 秒内不重复切，避免连滑
                                 log(4, TAG, "playCompleted skipped (throttle " + gap + "ms)");
