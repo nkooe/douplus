@@ -798,7 +798,11 @@ public class HookEntry extends XposedModule {
                         CharSequence cs = t.getText();
                         if (cs == null) return ret;
                         String txt = cs.toString().trim();
-                        if (!txt.contains("添加表情") && !txt.contains("添加")) return ret;
+                        // 必须是表情相关的按钮：
+                        // 早期写成 contains("添加")，导致「添加好友」「添加商品」
+                        // 「添加标签」也被挂上长按下载
+                        if (!txt.contains("添加表情") && !txt.contains("添加帖纸")
+                                && !txt.contains("添加表情包")) return ret;
                         final android.content.Context ctx = t.getContext();
                         t.setLongClickable(true);
                         t.setOnLongClickListener(new View.OnLongClickListener() {
@@ -816,6 +820,8 @@ public class HookEntry extends XposedModule {
                                     toast(ctx, "没有可用地址");
                                     return true;
                                 }
+                                // 用完就清：不清会把上一个表情的地址带到下次
+                                sDialogEmoji = null;
                                 saveMedia(ctx, url, "抖音表情_" + new java.text.SimpleDateFormat("MMdd_HHmmss", java.util.Locale.US).format(new java.util.Date()) + ".img");
                                 return true;
                             }
@@ -854,8 +860,46 @@ public class HookEntry extends XposedModule {
                     return ret;
                 }
             });
+            // 对话框关闭/消失时清空，避免旧地址残留
+            try {
+                final Method dismiss = android.app.Dialog.class.getDeclaredMethod("dismiss");
+                hook(dismiss).setId("dyhd-dialog-dismiss").intercept(new XposedInterface.Hooker() {
+                    @Override public Object intercept(XposedInterface.Chain chain) {
+                        try { sDialogEmoji = null; } catch (Throwable ignored) {}
+                        return chain.proceed();
+                    }
+                });
+            } catch (Throwable ignored) {}
             log(4, TAG, "dialog hook installed");
         } catch (Throwable t) { log(5, TAG, "dialog hook fail " + t); }
+
+        // 表情预览有时候用 PopupWindow 而不是 Dialog，
+        // 只 hook Dialog.show() 会捕获不到
+        try {
+            final Method showAt = android.widget.PopupWindow.class.getDeclaredMethod(
+                    "showAtLocation", View.class, int.class, int.class, int.class);
+            hook(showAt).setId("dyhd-popup-show").intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) {
+                    Object ret = chain.proceed();
+                    try {
+                        Object pw = chain.getThisObject();
+                        if (pw == null) return ret;
+                        java.lang.reflect.Field cf = android.widget.PopupWindow.class
+                                .getDeclaredField("mContentView");
+                        cf.setAccessible(true);
+                        Object content = cf.get(pw);
+                        if (content == null) return ret;
+                        Object e = findDeep(content, emojiCls, 0, 4);
+                        if (e != null) {
+                            sDialogEmoji = e;
+                            log(4, TAG, "popup emoji captured url=" + emojiBestUrl(e));
+                        }
+                    } catch (Throwable t) { log(5, TAG, "popup err " + t); }
+                    return ret;
+                }
+            });
+            log(4, TAG, "popup hook installed");
+        } catch (Throwable t) { log(5, TAG, "popup hook fail " + t); }
     }
 
     /** 广度优先深度搜索目标类型实例（跳过 View/图形/上下文类，限制节点数） */
