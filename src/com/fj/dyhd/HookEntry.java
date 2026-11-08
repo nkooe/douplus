@@ -955,6 +955,8 @@ public class HookEntry extends XposedModule {
     private static volatile long sLastUserTouchTs = 0; // 用户上次手动触摸的时刻
     private static volatile boolean sInjectingTouch = false; // 模块自己注入手势期间
     private static volatile long sLastSwipeExecTs = 0;       // swipeToNext 统一节流
+    private static volatile long sLastLabelScanTs = 0;       // 广告标签扫描专用
+    private static volatile long sLastTextHookTs = 0;        // TextView 广告标签专用
     private static volatile View sFab;              // 悬浮球
     private static volatile ViewGroup sFabHost;     // 悬浮球宿主
 
@@ -978,8 +980,8 @@ public class HookEntry extends XposedModule {
                     try {
                         if (isAdBlockEnabled() && hasAdLabelOnScreen()) {
                             long now2 = android.os.SystemClock.elapsedRealtime();
-                            if (now2 - sLastFeedSkipTs > 1500) {
-                                sLastFeedSkipTs = now2;
+                            if (now2 - sLastLabelScanTs > 1500) {
+                                sLastLabelScanTs = now2;
                                 log(4, TAG, "ad label scan hit -> swipe");
                                 swipeToNext();
                             }
@@ -1188,8 +1190,8 @@ public class HookEntry extends XposedModule {
                                 || "关注广告".equals(t);
                         if (!isAd) return ret;
                         long now = android.os.SystemClock.elapsedRealtime();
-                        if (now - sLastFeedSkipTs < 2000) return ret;
-                        sLastFeedSkipTs = now;
+                        if (now - sLastTextHookTs < 2000) return ret;
+                        sLastTextHookTs = now;
                         log(4, TAG, "ad label detected: " + t + " -> swipe");
                         swipeToNext();
                     } catch (Throwable ignored) {}
@@ -2667,9 +2669,18 @@ public class HookEntry extends XposedModule {
         }
 
         // 同一个 aweme 只跳一次（抖音划走后仍会反复调 getDesc）
-        Object lastSkipped = sLastSkippedAweme;
-        if (lastSkipped != null && (lastSkipped == aweme || lastSkipped.equals(aweme))) return;
-        sLastSkippedAweme = aweme;
+        // 去重用 awemeId：
+        // - 用对象身份(==)不行：getDesc 每次传入的是新对象，永远不相等
+        // - 用 equals 也不行：内容相似的不同视频会被当成同一条
+        String aid = null;
+        try {
+            aid = strCall(aweme, "getAid");
+        } catch (Throwable ignored) {}
+        if (aid == null || aid.isEmpty() || "null".equals(aid)) {
+            aid = "@obj@" + System.identityHashCode(aweme);
+        }
+        if (aid.equals(sLastSkippedAid)) return;
+        sLastSkippedAid = aid;
 
         long now = android.os.SystemClock.elapsedRealtime();
         if (now - sLastFeedSkipTs < 1200) return;   // 防连滑
@@ -2679,7 +2690,7 @@ public class HookEntry extends XposedModule {
     }
 
     private static volatile long sLastFeedSkipTs = 0L;
-    private static volatile Object sLastSkippedAweme = null;
+    private static volatile String sLastSkippedAid = null;
 
     /** 反射调 boolean 无参方法，不存在时返回 false */
     private static boolean boolCall(Object o, String name) {
@@ -2751,6 +2762,29 @@ public class HookEntry extends XposedModule {
     }
 
     /** 反射调 long 无参方法，失败返回 0 */
+    /** 调无参方法取字符串；方法不存在时回退到同名字段 */
+    private static String strCall(Object o, String name) {
+        if (o == null) return null;
+        try {
+            Method m = o.getClass().getMethod(name);
+            Object r = m.invoke(o);
+            if (r != null) return String.valueOf(r);
+        } catch (Throwable ignored) {}
+        try {
+            Object r = field(o, name);
+            if (r != null) return String.valueOf(r);
+        } catch (Throwable ignored) {}
+        // getAid → aid
+        if (name.startsWith("get") && name.length() > 3) {
+            String fn = Character.toLowerCase(name.charAt(3)) + name.substring(4);
+            try {
+                Object r = field(o, fn);
+                if (r != null) return String.valueOf(r);
+            } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
     private static long longCall(Object o, String name) {
         if (o == null) return 0L;
         try {
